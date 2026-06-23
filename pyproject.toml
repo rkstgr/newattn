@@ -1,0 +1,52 @@
+[project]
+name = "newattn"
+version = "0.1.0"
+description = "Minimal, modular recreation of the Zoology MQAR state-size-vs-recall experiments"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = { text = "MIT" }
+dependencies = [
+    "torch",
+    "numpy",
+    "einops",
+    "tqdm",
+    "matplotlib",
+    "wandb",
+]
+
+[project.optional-dependencies]
+# Gated DeltaNet 2 pulls in flash-linear-attention + Triton (CUDA GPU only).
+gdn2 = ["flash-linear-attention"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/newattn"]
+
+# ---------------------------------------------------------------------------
+# Pixi (local development / CPU). Colab users just `pip install -e .` instead;
+# see the README. Python comes from conda; everything else is pip wheels so the
+# environment matches Colab's pip world.
+# ---------------------------------------------------------------------------
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "osx-64", "linux-64"]
+
+[tool.pixi.dependencies]
+python = ">=3.10,<3.13"
+
+[tool.pixi.pypi-dependencies]
+newattn = { path = ".", editable = true }
+
+# The `gdn2` feature is generated automatically from [project.optional-dependencies].
+[tool.pixi.environments]
+default = { solve-group = "default" }
+gdn2 = { features = ["gdn2"], solve-group = "default" }
+
+[tool.pixi.tasks]
+exp001b = "python experiments/exp001b_transformer.py"
+exp002 = "python experiments/exp002_mamba2.py"
+# exp003 (Gated DeltaNet 2) needs the gdn2 environment + a CUDA GPU:
+#   pixi run -e gdn2 python experiments/exp003_gdn2.py

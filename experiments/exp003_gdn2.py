@@ -1,18 +1,19 @@
 """MQAR exp003 -- Gated DeltaNet 2 (selectable mixer): state size vs. recall accuracy.
 
-Extends exp002 with a selectable sub-quadratic mixer. The default is `gdn2`
-(fla.layers.GatedDeltaNet2 from flash-linear-attention), whose delta-rule update is
+Extends exp002 with a selectable sub-quadratic mixer. The default is `gdn2`, a pure-PyTorch
+port of fla's GatedDeltaNet2 (no Triton), whose decoupled erase/write delta-rule update is
 generally more recall-efficient per state byte than a diagonal SSM. State size =
 4 * n_layers * num_heads * head_dim * head_v_dim bytes (num_heads = d_model // head_dim),
 independent of sequence length.
 
-`gdn2` requires a CUDA GPU + Triton (and `pip install flash-linear-attention`); the
-forward runs under bf16 autocast. Pass `--mixer mamba2` to run the CPU-friendly Mamba2
-mixer instead (same harness, for an apples-to-apples overlay).
+The default `gdn2` runs anywhere (CPU or any GPU, incl. Turing/T4) -- no CUDA/Triton needed.
+For the fast fla Triton kernels (Ampere+ GPU, bf16) pass `--mixer gdn2_triton` (needs
+`pip install flash-linear-attention`). Pass `--mixer mamba2` for the Mamba2 overlay.
 
-Run (needs a GPU for gdn2):
-    pixi run -e gdn2 python experiments/exp003_gdn2.py
-    python experiments/exp003_gdn2.py --mixer mamba2          # CPU-friendly comparison
+Run:
+    python experiments/exp003_gdn2.py                          # pure-PyTorch gdn2 (CPU/T4)
+    pixi run -e gdn2 python experiments/exp003_gdn2.py --mixer gdn2_triton   # fla kernels (GPU)
+    python experiments/exp003_gdn2.py --mixer mamba2          # Mamba2 comparison
     python experiments/exp003_gdn2.py --help
 """
 import _bootstrap  # noqa: F401  (puts ./src on sys.path if newattn isn't installed)

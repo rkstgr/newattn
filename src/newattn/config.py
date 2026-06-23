@@ -13,20 +13,21 @@ from dataclasses import dataclass, field
 DEFAULT_D_MODELS: dict[str, list[int]] = {
     "attention": [8, 16, 32, 48, 64, 128],
     "mamba2": [8, 16, 32, 48, 64],
-    # gdn2 widths are multiples of head_dim (64) so the Triton kernel gets a
-    # kernel-friendly head dim and an integral head count.
+    # `gdn2` (pure-PyTorch) is single-head with head_dim = d_model, so state ~ d_model**2
+    # (8 * d_model**2 bytes at n_layers=2, expand_v=1); any width works. `gdn2_triton` keeps
+    # a fixed head_dim=64 (num_heads = d_model // 64), so its widths must be multiples of 64.
     "gdn2": [64, 128, 192, 256, 320],
+    "gdn2_triton": [64, 128, 192, 256, 320],
 }
 
 # Peak learning rate per d_model, hand-tuned per mixer (one entry per width above).
 # Override on the command line with `--lr` (flat LR for the whole sweep) or by editing
 # the `lr_per_d_model` on each experiment's SweepConfig.
 DEFAULT_LR_PER_D_MODEL: dict[str, dict[int, float]] = {
-    # carried over from the previous clamped-1/width rule (edit to taste)
     "attention": {8: 1.5e-3, 16: 1.5e-3, 32: 1e-3, 48: 1e-3, 64: 7.66e-4, 128: 3.83e-4, 192: 2.55e-4},
     "mamba2": {8: 3e-3, 16: 2e-3, 32: 1e-3, 48: 1e-3, 64: 8e-4},
-    # carried over from the previous clamped-1/width rule (edit to taste)
-    "gdn2": {64: 7.66e-4, 128: 5e-4, 192: 5e-4, 256: 5e-4, 320: 5e-4},
+    "gdn2": {32: 1e-3, 48: 1e-4, 64: 8e-4, 128: 5e-4},
+    "gdn2_triton": {64: 7.66e-4, 128: 5e-4, 192: 5e-4, 256: 5e-4, 320: 5e-4},
 }
 
 
@@ -54,7 +55,7 @@ class ModelConfig:
 
     d_model: int = 128
     n_layers: int = 2
-    mixer: str = "attention"  # "attention" | "mamba2" | "gdn2"
+    mixer: str = "attention"  # "attention" | "mamba2" | "gdn2" (pure-PyTorch) | "gdn2_triton"
 
     # ---- Attention (MHA) sequence-mixer hyper-parameters ----
     num_heads: int = 1
@@ -93,7 +94,8 @@ class ModelConfig:
         self.sequence_mixer = {
             "attention": "zoology.mixers.attention.MHA",
             "mamba2": "zoology.mixers.mamba2.Mamba2",
-            "gdn2": "fla.layers.gdn2.GatedDeltaNet2",
+            "gdn2": "newattn.mixers.gdn2.GatedDeltaNet2Naive",
+            "gdn2_triton": "fla.layers.gdn2.GatedDeltaNet2",
         }[self.mixer]
         if self.gdn2_num_heads is None:
             self.gdn2_num_heads = max(1, self.d_model // self.gdn2_head_dim)
@@ -125,7 +127,7 @@ class TrainParams:
 class SweepConfig:
     """A full state-size sweep: one training run per width in `d_models`."""
 
-    mixer: str = "attention"  # "attention" | "mamba2" | "gdn2"
+    mixer: str = "attention"  # "attention" | "mamba2" | "gdn2" (pure-PyTorch) | "gdn2_triton"
     exp_id: str = "exp"  # short tag used in W&B group / run names
     d_models: list[int] = field(default_factory=lambda: list(DEFAULT_D_MODELS["attention"]))
     # Peak learning rate per d_model (one entry for every width in `d_models`).

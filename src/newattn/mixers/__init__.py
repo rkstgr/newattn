@@ -1,16 +1,17 @@
 """Sequence-mixer registry.
 
-Each mixer module (attention, mamba2, gdn2) exposes a `SPEC: MixerSpec`. To add a new
-mixer, drop in a module with an `nn.Module` (forward + `state_size`) and a `SPEC`, then
-register it here.
+Each mixer module (attention, mamba2, gdn2, gdn2_triton) exposes a `SPEC: MixerSpec`. `gdn2`
+is the pure-PyTorch Gated DeltaNet 2 (no Triton; CPU/Turing-friendly); `gdn2_triton` is the
+fla-kernel version (Ampere+ GPU). To add a new mixer, drop in a module with an `nn.Module`
+(forward + `state_size`) and a `SPEC`, then register it here.
 """
 from __future__ import annotations
 
-from . import attention, gdn2, mamba2
+from . import attention, gdn2, gdn2_triton, mamba2
 from .base import MixerSpec
 
 MIXERS: dict[str, MixerSpec] = {
-    spec.name: spec for spec in (attention.SPEC, mamba2.SPEC, gdn2.SPEC)
+    spec.name: spec for spec in (attention.SPEC, mamba2.SPEC, gdn2.SPEC, gdn2_triton.SPEC)
 }
 
 

@@ -25,6 +25,13 @@ from tqdm.auto import tqdm
 
 from .config import TrainParams
 
+# Autocast dtype names -> torch dtype. T4/Turing has no native bf16; use "fp16".
+_AMP_DTYPES = {
+    "bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
+    "fp16": torch.float16, "float16": torch.float16,
+    "fp32": torch.float32, "float32": torch.float32,
+}
+
 
 def compute_metrics(preds, targets, ignore_index=-100):
     """Per-example recall accuracy over non-ignored positions (zoology.train.compute_metrics)."""
@@ -40,7 +47,7 @@ def train_one_run(model, train_dl, test_dl, logger, peak_lr: float, train: Train
     model.to(device)
     loss_fn = nn.CrossEntropyLoss()  # default ignore_index = -100
 
-    amp_dtype = torch.bfloat16
+    amp_dtype = _AMP_DTYPES[train.amp_dtype]
 
     def forward_logits(inputs):
         with torch.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):

@@ -26,6 +26,8 @@ def _build_parser(defaults: SweepConfig) -> argparse.ArgumentParser:
     p.add_argument("--lr", type=float, default=None,
                    help="flat peak LR for every width (overrides the per-d_model map)")
     p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--amp-dtype", choices=["bf16", "fp16", "fp32"], default=None,
+                   help="autocast dtype for AMP mixers like gdn2 (fp16 for Turing/T4; default bf16)")
     p.add_argument("--max-epochs", type=int, default=None)
     p.add_argument("--num-train-examples", type=int, default=None, help="handy for a quick smoke test")
     p.add_argument("--num-test-examples", type=int, default=None)
@@ -56,6 +58,8 @@ def config_from_args(defaults: SweepConfig, argv=None) -> SweepConfig:
     if args.seed is not None:
         cfg.seed = args.seed
         cfg.train.seed = args.seed
+    if args.amp_dtype is not None:
+        cfg.train.amp_dtype = args.amp_dtype
     if args.max_epochs is not None:
         cfg.train.max_epochs = args.max_epochs
     if args.num_train_examples is not None:

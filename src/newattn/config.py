@@ -114,6 +114,7 @@ class TrainParams:
     test_batch_size: int = 256
     warmup_epochs: float = 1.0  # linear LR warmup over this many epochs
     grad_clip: float = 1.0  # max gradient norm (<= 0 disables clipping)
+    amp_dtype: str = "bfloat16"  # autocast dtype when use_amp: "bf16"/"fp16"/"fp32" (fp16 for Turing/T4)
     early_stopping_metric: str = "valid/accuracy"
     early_stopping_threshold: float = 0.99  # stop early once the task is solved
     patience: int = 5  # stop if valid/accuracy hasn't improved for N epochs

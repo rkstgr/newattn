@@ -74,7 +74,7 @@ def run_sweep(cfg: SweepConfig) -> list[dict]:
 
             run = wandb.init(
                 project=cfg.wandb_project, entity=cfg.wandb_entity,
-                name=f"d_model{d_model}-state{state_size}", group=group, job_type="train",
+                name=f"{cfg.mixer}-d{d_model}-state{state_size//1000}k", group=group, job_type="train",
                 mode=wandb_mode, config=full_config, reinit=True,
                 tags=["mqar", cfg.mixer, "state-size-sweep"],
             )

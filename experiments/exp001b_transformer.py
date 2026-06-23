@@ -18,8 +18,7 @@ from newattn.config import DEFAULT_D_MODELS, DEFAULT_LR_PER_D_MODEL, SweepConfig
 DEFAULTS = SweepConfig(
     mixer="attention",
     exp_id="exp001b",
-    ##d_models=DEFAULT_D_MODELS["attention"],  # [8, 16, 64, 128, 192]
-    d_models=[32, 48], # post-fill these sizes
+    d_models=DEFAULT_D_MODELS["attention"],
     lr_per_d_model=DEFAULT_LR_PER_D_MODEL["attention"],
     seed=123,
     wandb_project="zoology-mqar",

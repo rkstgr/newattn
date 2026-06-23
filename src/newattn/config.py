@@ -16,7 +16,7 @@ DEFAULT_D_MODELS: dict[str, list[int]] = {
     # `gdn2` (pure-PyTorch) is single-head with head_dim = d_model, so state ~ d_model**2
     # (8 * d_model**2 bytes at n_layers=2, expand_v=1); any width works. `gdn2_triton` keeps
     # a fixed head_dim=64 (num_heads = d_model // 64), so its widths must be multiples of 64.
-    "gdn2": [64, 128, 192, 256, 320],
+    "gdn2": [32, 48, 64, 96, 128],
     "gdn2_triton": [64, 128, 192, 256, 320],
 }
 
@@ -26,7 +26,7 @@ DEFAULT_D_MODELS: dict[str, list[int]] = {
 DEFAULT_LR_PER_D_MODEL: dict[str, dict[int, float]] = {
     "attention": {8: 1.5e-3, 16: 1.5e-3, 32: 1e-3, 48: 1e-3, 64: 7.66e-4, 128: 3.83e-4, 192: 2.55e-4},
     "mamba2": {8: 3e-3, 16: 2e-3, 32: 1e-3, 48: 1e-3, 64: 8e-4},
-    "gdn2": {32: 1e-3, 48: 1e-4, 64: 8e-4, 128: 5e-4},
+    "gdn2": {32: 1e-3, 48: 1e-4, 64: 8e-4, 96: 7e-4,128: 5e-4},
     "gdn2_triton": {64: 7.66e-4, 128: 5e-4, 192: 5e-4, 256: 5e-4, 320: 5e-4},
 }
 

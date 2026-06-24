@@ -18,8 +18,10 @@ from .tracking import WandbLogger, build_full_config, maybe_login
 from .train import train_one_run
 
 MIXER_LABEL = {"attention": "Transformer (attention)", "mamba2": "Mamba2",
-               "gdn2": "Gated DeltaNet 2", "gdn2_triton": "Gated DeltaNet 2 (Triton)"}
-MIXER_COLOR = {"attention": "#3b76af", "mamba2": "#c4694b", "gdn2": "#4b78c4", "gdn2_triton": "#6a4bc4"}
+               "gdn2": "Gated DeltaNet 2", "gdn2_triton": "Gated DeltaNet 2 (Triton)",
+               "titans": "Titans (neural memory)"}
+MIXER_COLOR = {"attention": "#3b76af", "mamba2": "#c4694b", "gdn2": "#4b78c4",
+               "gdn2_triton": "#6a4bc4", "titans": "#4bb37a"}
 
 
 def run_sweep(cfg: SweepConfig) -> list[dict]:

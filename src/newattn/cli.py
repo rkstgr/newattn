@@ -19,9 +19,9 @@ def _build_parser(defaults: SweepConfig) -> argparse.ArgumentParser:
         description=f"MQAR state-size sweep ({defaults.exp_id}, default mixer={defaults.mixer}).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--mixer", choices=["attention", "mamba2", "gdn2", "gdn2_triton"], default=None,
-                   help="sequence mixer (gdn2 = pure-PyTorch, gdn2_triton = fla kernels; "
-                        "overrides the experiment default)")
+    p.add_argument("--mixer", choices=["attention", "mamba2", "gdn2", "gdn2_triton", "titans"], default=None,
+                   help="sequence mixer (gdn2 = pure-PyTorch, gdn2_triton = fla kernels, "
+                        "titans = MLP neural-memory; overrides the experiment default)")
     p.add_argument("--d-models", type=int, nargs="+", default=None,
                    help="explicit width sweep (defaults are mixer-specific)")
     p.add_argument("--lr", type=float, default=None,

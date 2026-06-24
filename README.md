@@ -16,6 +16,7 @@ experiment scripts.
 | `exp001b` | Transformer (attention) | `4·n_layers·2·d_model·seq_len` | unbounded state (KV cache) |
 | `exp002` | Mamba2 (pure PyTorch) | `4·n_layers·expand·d_model·d_state` | bounded state |
 | `exp003` | Gated DeltaNet 2 (fla) | `4·n_layers·num_heads·head_dim·head_v_dim` | bounded state |
+| `exp004` | Titans (neural memory) | `4·n_layers·num_heads·2·head_dim·mem_hidden` | bounded state (MLP fast weights) |
 
 ## Layout
 
@@ -28,6 +29,7 @@ src/newattn/
     attention.py #   MHA (zoology.mixers.attention)
     mamba2.py    #   pure-PyTorch Mamba2 SSD scan
     gdn2.py      #   wrapper over fla.layers.GatedDeltaNet2
+    titans.py    #   pure-PyTorch Titans MLP neural memory
   train.py       # training loop (zoology/train.py + warmup/clip/early-stop)
   tracking.py    # Weights & Biases harness
   sweep.py       # run_sweep() + the recreated plot
@@ -36,6 +38,7 @@ experiments/
   exp001b_transformer.py
   exp002_mamba2.py
   exp003_gdn2.py
+  exp004_titans.py
 ```
 
 ## Configure

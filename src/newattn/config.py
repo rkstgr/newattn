@@ -18,6 +18,9 @@ DEFAULT_D_MODELS: dict[str, list[int]] = {
     # a fixed head_dim=64 (num_heads = d_model // 64), so its widths must be multiples of 64.
     "gdn2": [32, 48, 64, 96, 128],
     "gdn2_triton": [64, 128, 192, 256, 320],
+    # `titans` (pure-PyTorch) is single-head with head_dim = d_model and an MLP fast memory, so
+    # state ~ d_model**2 (8 * memory_mult * d_model**2 bytes at n_layers=2); any width works.
+    "titans": [32, 48, 64, 96, 128],
 }
 
 # Peak learning rate per d_model, hand-tuned per mixer (one entry per width above).
@@ -26,8 +29,9 @@ DEFAULT_D_MODELS: dict[str, list[int]] = {
 DEFAULT_LR_PER_D_MODEL: dict[str, dict[int, float]] = {
     "attention": {8: 1.5e-3, 16: 1.5e-3, 32: 1e-3, 48: 1e-3, 64: 7.66e-4, 128: 3.83e-4, 192: 2.55e-4},
     "mamba2": {8: 3e-3, 16: 2e-3, 32: 1e-3, 48: 1e-3, 64: 8e-4},
-    "gdn2": {32: 1e-3, 48: 1e-4, 64: 8e-4, 96: 7e-4,128: 5e-4},
+    "gdn2": {32: 8e-4, 48: 8e-4, 64: 8e-4, 96: 7e-4, 128: 5e-4},
     "gdn2_triton": {64: 7.66e-4, 128: 5e-4, 192: 5e-4, 256: 5e-4, 320: 5e-4},
+    "titans": {32: 1e-3, 48: 8e-4, 64: 8e-4, 96: 7e-4, 128: 5e-4},
 }
 
 
@@ -55,7 +59,7 @@ class ModelConfig:
 
     d_model: int = 128
     n_layers: int = 2
-    mixer: str = "attention"  # "attention" | "mamba2" | "gdn2" (pure-PyTorch) | "gdn2_triton"
+    mixer: str = "attention"  # "attention" | "mamba2" | "gdn2" (pure-PyTorch) | "gdn2_triton" | "titans"
 
     # ---- Attention (MHA) sequence-mixer hyper-parameters ----
     num_heads: int = 1
@@ -77,6 +81,13 @@ class ModelConfig:
     gdn2_conv_size: int = 4
     gdn2_allow_neg_eigval: bool = False
 
+    # ---- Titans (neural-memory MLP fast-weight) sequence-mixer hyper-parameters ----
+    titans_num_heads: int = 1  # per-head MLP memory; head_dim = d_model // num_heads
+    titans_memory_mult: int = 4  # memory MLP hidden expansion: mem_hidden = memory_mult * head_dim
+    titans_max_inner_lr: float = 0.05  # cap on the inner-loop (test-time) learning rate beta
+    titans_use_short_conv: bool = True  # short causal conv on q/k/v (as in the reference)
+    titans_conv_size: int = 4
+
     # ---- shared ----
     mlp_hidden_mult: int = 4
     vocab_size: int = 8192
@@ -96,6 +107,7 @@ class ModelConfig:
             "mamba2": "zoology.mixers.mamba2.Mamba2",
             "gdn2": "newattn.mixers.gdn2.GatedDeltaNet2Naive",
             "gdn2_triton": "fla.layers.gdn2.GatedDeltaNet2",
+            "titans": "newattn.mixers.titans.Titans",
         }[self.mixer]
         if self.gdn2_num_heads is None:
             self.gdn2_num_heads = max(1, self.d_model // self.gdn2_head_dim)
@@ -127,7 +139,7 @@ class TrainParams:
 class SweepConfig:
     """A full state-size sweep: one training run per width in `d_models`."""
 
-    mixer: str = "attention"  # "attention" | "mamba2" | "gdn2" (pure-PyTorch) | "gdn2_triton"
+    mixer: str = "attention"  # "attention" | "mamba2" | "gdn2" (pure-PyTorch) | "gdn2_triton" | "titans"
     exp_id: str = "exp"  # short tag used in W&B group / run names
     d_models: list[int] = field(default_factory=lambda: list(DEFAULT_D_MODELS["attention"]))
     # Peak learning rate per d_model (one entry for every width in `d_models`).

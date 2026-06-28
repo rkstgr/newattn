@@ -263,10 +263,11 @@ class GatedDeltaNet2Naive(nn.Module):
 
 
 def build(cfg, layer_idx: int) -> nn.Module:
-    # Single head with head_dim tied to d_model (gdn2_head_dim / gdn2_num_heads are only
-    # used by the gdn2_triton mixer, which needs a fixed kernel-friendly head_dim).
+    # head_dim (the memory knob) is decoupled from d_model: the q/k/v projections map
+    # d_model -> num_heads * head_dim, so the recurrent state can be swept independently of the
+    # residual-stream width. num_heads defaults (in __post_init__) to d_model // gdn2_head_dim.
     return GatedDeltaNet2Naive(
-        cfg.d_model, head_dim=cfg.d_model, num_heads=1,
+        cfg.d_model, head_dim=cfg.gdn2_head_dim, num_heads=cfg.gdn2_num_heads,
         expand_v=cfg.gdn2_expand_v, mode=cfg.gdn2_mode, use_short_conv=cfg.gdn2_use_short_conv,
         conv_size=cfg.gdn2_conv_size, allow_neg_eigval=cfg.gdn2_allow_neg_eigval, layer_idx=layer_idx,
     )
@@ -274,18 +275,20 @@ def build(cfg, layer_idx: int) -> nn.Module:
 
 def state_size_bytes(cfg, n_layers: int, seq_len: int) -> int:
     """Closed form of LanguageModel.state_size for the pure-PyTorch Gated DeltaNet 2:
-    4 * n_layers * d_model * head_v_dim  (single head, head_dim = d_model,
-    head_v_dim = d_model * expand_v).
+    4 * n_layers * num_v_heads * head_dim * head_v_dim  (head_dim = gdn2_head_dim,
+    head_v_dim = head_dim * expand_v, num_v_heads = num_heads).
 
-    Independent of sequence length (bounded recurrent state)."""
-    head_v_dim = int(cfg.d_model * cfg.gdn2_expand_v)
-    return 4 * n_layers * cfg.d_model * head_v_dim
+    Independent of sequence length (bounded recurrent state) and of d_model."""
+    num_heads = cfg.gdn2_num_heads or max(1, cfg.d_model // cfg.gdn2_head_dim)
+    head_v_dim = int(cfg.gdn2_head_dim * cfg.gdn2_expand_v)
+    return 4 * n_layers * num_heads * cfg.gdn2_head_dim * head_v_dim
 
 
 def dims_str(cfg) -> str:
-    hd = cfg.d_model
+    nh = cfg.gdn2_num_heads or max(1, cfg.d_model // cfg.gdn2_head_dim)
+    hd = cfg.gdn2_head_dim
     hv = int(hd * cfg.gdn2_expand_v)
-    return f"num_heads={1:>3d}  head_dim={hd:>3d}  head_v_dim={hv:>3d}"
+    return f"num_heads={nh:>3d}  head_dim={hd:>3d}  head_v_dim={hv:>3d}"
 
 
 SPEC = MixerSpec(

@@ -12,7 +12,7 @@ from dataclasses import asdict
 import numpy as np
 import torch
 
-from .config import ModelConfig, MQARTaskConfig, TrainParams
+from .config import ModelConfig, MQARTaskConfig, SweepPoint, TrainParams
 
 
 def maybe_login(wandb_mode: str) -> str:
@@ -30,7 +30,7 @@ def maybe_login(wandb_mode: str) -> str:
 
 
 def build_full_config(*, mixer: str, task: MQARTaskConfig, train: TrainParams,
-                      model_cfg: ModelConfig, lr_per_d_model: dict[int, float], d_models: list[int],
+                      model_cfg: ModelConfig, points: list[SweepPoint], d_model: int,
                       sweep_id: str, seed: int, state_size: int, num_parameters: int,
                       peak_lr: float, fingerprint: str, device: str) -> dict:
     """The full, reproducible config saved to W&B."""
@@ -42,9 +42,9 @@ def build_full_config(*, mixer: str, task: MQARTaskConfig, train: TrainParams,
         "sweep": {
             "sweep_id": sweep_id,
             "mixer": mixer,
-            "d_models": list(d_models),
-            "n_points": len(d_models),
-            "lr_per_d_model": {str(k): v for k, v in lr_per_d_model.items()},
+            "d_model": d_model,
+            "n_points": len(points),
+            "points": [asdict(pt) for pt in points],
         },
         "derived": {
             "state_size": state_size,

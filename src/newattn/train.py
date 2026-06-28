@@ -4,7 +4,7 @@ AdamW, cross-entropy with `ignore_index=-100` (so only answer positions count), 
 per-example recall accuracy over non-ignored positions. On top of the zoology defaults:
 
 * **Per-step LR schedule:** linear warmup over `warmup_epochs`, then cosine decay to 0.
-  The peak LR is the per-width value from the experiment's `lr_per_d_model` map.
+  The peak LR is each sweep point's `SweepPoint.lr`.
 * **Gradient clipping** at `max_norm=grad_clip`.
 * **Early stopping** when the task is solved (`valid/accuracy > threshold`) or when
   validation accuracy plateaus for `patience` epochs. We report the **best** accuracy.

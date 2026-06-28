@@ -16,21 +16,21 @@ See `experiments/` for the runnable sweeps and the README for how to run them in
 from __future__ import annotations
 
 from .config import (
-    DEFAULT_D_MODELS,
-    DEFAULT_LR_PER_D_MODEL,
+    DEFAULT_POINTS,
     ModelConfig,
     MQARTaskConfig,
     SweepConfig,
+    SweepPoint,
     TrainParams,
 )
 from .sweep import run_sweep
 
 __all__ = [
-    "DEFAULT_D_MODELS",
-    "DEFAULT_LR_PER_D_MODEL",
+    "DEFAULT_POINTS",
     "ModelConfig",
     "MQARTaskConfig",
     "SweepConfig",
+    "SweepPoint",
     "TrainParams",
     "run_sweep",
 ]

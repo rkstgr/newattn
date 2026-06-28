@@ -8,30 +8,44 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-# Default state-size sweep (x-axis) per mixer. Each width maps to one point on the
-# state-size axis; see `newattn.mixers` for the per-mixer state-size formula.
-DEFAULT_D_MODELS: dict[str, list[int]] = {
-    "attention": [8, 16, 32, 48, 64, 128],
-    "mamba2": [8, 16, 32, 48, 64],
-    # `gdn2` (pure-PyTorch) is single-head with head_dim = d_model, so state ~ d_model**2
-    # (8 * d_model**2 bytes at n_layers=2, expand_v=1); any width works. `gdn2_triton` keeps
-    # a fixed head_dim=64 (num_heads = d_model // 64), so its widths must be multiples of 64.
-    "gdn2": [32, 48, 64, 96, 128],
-    "gdn2_triton": [64, 128, 192, 256, 320],
-    # `titans` (pure-PyTorch) is single-head with head_dim = d_model and an MLP fast memory, so
-    # state ~ d_model**2 (8 * memory_mult * d_model**2 bytes at n_layers=2); any width works.
-    "titans": [32, 48, 64, 96, 128],
-}
 
-# Peak learning rate per d_model, hand-tuned per mixer (one entry per width above).
-# Override on the command line with `--lr` (flat LR for the whole sweep) or by editing
-# the `lr_per_d_model` on each experiment's SweepConfig.
-DEFAULT_LR_PER_D_MODEL: dict[str, dict[int, float]] = {
-    "attention": {8: 1.5e-3, 16: 1.5e-3, 32: 1e-3, 48: 1e-3, 64: 7.66e-4, 128: 3.83e-4, 192: 2.55e-4},
-    "mamba2": {8: 3e-3, 16: 2e-3, 32: 1e-3, 48: 1e-3, 64: 8e-4},
-    "gdn2": {32: 8e-4, 48: 8e-4, 64: 8e-4, 96: 7e-4, 128: 5e-4},
-    "gdn2_triton": {64: 7.66e-4, 128: 5e-4, 192: 5e-4, 256: 5e-4, 320: 5e-4},
-    "titans": {32: 1e-3, 48: 8e-4, 64: 8e-4, 96: 7e-4, 128: 5e-4},
+@dataclass
+class SweepPoint:
+    """One run in a state-size sweep: model-config overrides applied at the fixed `d_model`,
+    plus the peak LR. State size is derived from the resulting `ModelConfig`, so each point lands
+    on the state-size x-axis independently of the (fixed) residual-stream width."""
+
+    overrides: dict  # e.g. {"gdn2_head_dim": 32, "gdn2_expand_v": 2.0}
+    lr: float
+    label: str | None = None  # short tag for run name / plot annotation
+
+
+# Default state-size sweep per mixer at a fixed d_model (see `SweepConfig.d_model`, default 32).
+# Each point varies the mixer's recurrent-state knob(s) -- decoupled from d_model -- so the
+# x-axis is the state size, not the model width. LRs are hand-tuned starting points; override the
+# whole sweep with `--lr` or edit the `points` list on each experiment's SweepConfig.
+DEFAULT_POINTS: dict[str, list[SweepPoint]] = {
+    # Attention has no bounded state knob (KV cache = 2 * d_model * seq_len): one fixed baseline.
+    "attention": [SweepPoint({}, 1e-3, "baseline")],
+    # Mamba2: sweep the SSM state dim d_state (state bytes = 4 * n_layers * expand * d_model * d_state).
+    "mamba2": [SweepPoint({"d_state": n}, 1e-3, f"ds{n}") for n in (4, 8, 16, 32, 64, 128)],
+    # gdn2 (pure-PyTorch): single head, sweep (head_dim, expand_v); state bytes = 8 * head_dim^2 * expand_v.
+    "gdn2": [
+        SweepPoint({"gdn2_head_dim": hd, "gdn2_num_heads": 1, "gdn2_expand_v": ev}, 8e-4, f"hd{hd}v{ev:g}")
+        for hd, ev in [(8, 1.0), (16, 1.0), (16, 2.0), (32, 1.0), (32, 2.0), (48, 2.0), (64, 2.0)]
+    ],
+    # gdn2_triton: fixed kernel-friendly head_dim=64, so num_heads = d_model // 64 and the state
+    # scales linearly with d_model -- here the width itself is the (decoupled-kernel) state knob,
+    # overridden per point. Needs a CUDA GPU + flash-linear-attention.
+    "gdn2_triton": [
+        SweepPoint({"d_model": d, "gdn2_head_dim": 64}, lr, f"d{d}")
+        for d, lr in [(64, 7.66e-4), (128, 5e-4), (192, 5e-4), (256, 5e-4), (320, 5e-4)]
+    ],
+    # titans (pure-PyTorch): single head, sweep (head_dim, memory_mult); state bytes = 8 * memory_mult * head_dim^2.
+    "titans": [
+        SweepPoint({"titans_head_dim": hd, "titans_memory_mult": mm}, 1e-3, f"hd{hd}m{mm}")
+        for hd, mm in [(16, 2), (16, 4), (32, 2), (32, 4), (48, 2), (64, 2)]
+    ],
 }
 
 
@@ -82,7 +96,8 @@ class ModelConfig:
     gdn2_allow_neg_eigval: bool = False
 
     # ---- Titans (neural-memory MLP fast-weight) sequence-mixer hyper-parameters ----
-    titans_num_heads: int = 1  # per-head MLP memory; head_dim = d_model // num_heads
+    titans_num_heads: int = 1  # per-head MLP memory
+    titans_head_dim: int | None = None  # per-head dim (the memory knob); None -> d_model // num_heads
     titans_memory_mult: int = 4  # memory MLP hidden expansion: mem_hidden = memory_mult * head_dim
     titans_max_inner_lr: float = 0.05  # cap on the inner-loop (test-time) learning rate beta
     titans_use_short_conv: bool = True  # short causal conv on q/k/v (as in the reference)
@@ -117,9 +132,9 @@ class ModelConfig:
 class TrainParams:
     """Training hyper-parameters (zoology/train.py + warmup, grad-clip, patience).
 
-    The peak learning rate is *not* fixed here -- it is set per run from the
-    experiment's `lr_per_d_model` map. The schedule is a linear warmup over
-    `warmup_epochs` followed by per-step cosine decay to 0.
+    The peak learning rate is *not* fixed here -- it is set per run from each
+    `SweepPoint.lr`. The schedule is a linear warmup over `warmup_epochs`
+    followed by per-step cosine decay to 0.
     """
 
     max_epochs: int = 32
@@ -137,13 +152,16 @@ class TrainParams:
 
 @dataclass
 class SweepConfig:
-    """A full state-size sweep: one training run per width in `d_models`."""
+    """A full state-size sweep: one training run per `SweepPoint`, at a fixed `d_model`.
+
+    The residual-stream width `d_model` is held constant (default 32) so that the state size --
+    swept via each point's mixer-specific knobs (e.g. d_state, head_dim, expand_v, memory_mult) --
+    is decoupled from model capacity. State size is the x-axis."""
 
     mixer: str = "attention"  # "attention" | "mamba2" | "gdn2" (pure-PyTorch) | "gdn2_triton" | "titans"
     exp_id: str = "exp"  # short tag used in W&B group / run names
-    d_models: list[int] = field(default_factory=lambda: list(DEFAULT_D_MODELS["attention"]))
-    # Peak learning rate per d_model (one entry for every width in `d_models`).
-    lr_per_d_model: dict[int, float] = field(default_factory=dict)
+    d_model: int = 32  # fixed residual-stream width for every point in the sweep
+    points: list[SweepPoint] = field(default_factory=lambda: list(DEFAULT_POINTS["attention"]))
     seed: int = 123
 
     task: MQARTaskConfig = field(default_factory=MQARTaskConfig)
@@ -155,18 +173,9 @@ class SweepConfig:
     wandb_mode: str = "online"  # "online" | "offline" | "disabled"
     group: str | None = None  # W&B group; defaults to f"mqar-{mixer}-{exp_id}"
 
-    # Optional per-model-config overrides applied to every ModelConfig in the sweep
-    # (e.g. {"d_state": 64} to sweep at a different Mamba2 state dim).
+    # Optional per-model-config overrides applied to every point in the sweep (merged under each
+    # point's own overrides), e.g. {"expand": 2} to fix Mamba2's inner expansion across the sweep.
     model_overrides: dict = field(default_factory=dict)
-
-    def lr_for(self, d_model: int) -> float:
-        try:
-            return self.lr_per_d_model[d_model]
-        except KeyError:
-            raise KeyError(
-                f"no learning rate for d_model={d_model}; add it to lr_per_d_model "
-                f"(have {sorted(self.lr_per_d_model)}) or pass --lr to set a flat LR"
-            ) from None
 
     def resolved_group(self) -> str:
         return self.group or f"mqar-{self.mixer}-{self.exp_id}"

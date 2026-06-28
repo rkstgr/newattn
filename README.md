@@ -50,24 +50,29 @@ defaults in a `SweepConfig` at the top of the file:
 - **`ModelConfig`** — `d_model`, `n_layers`, and mixer-specific knobs (`d_state`/`expand`
   for Mamba2, `gdn2_head_dim`/`gdn2_expand_v` for GDN2, `num_heads` for attention).
 - **`TrainParams`** — `max_epochs`, `batch_size`, `weight_decay`, `grad_clip`, early stop.
-- **`SweepConfig`** — ties it together: `mixer`, `d_models` (the sweep), `lr_per_d_model`
-  (one peak LR per width), `seed`, and W&B `wandb_project` / `wandb_entity` / `wandb_mode`.
+- **`SweepConfig`** — ties it together: `mixer`, `d_model` (the fixed residual-stream width),
+  `points` (the list of `SweepPoint`s that sweep the state size), `seed`, and W&B
+  `wandb_project` / `wandb_entity` / `wandb_mode`.
+- **`SweepPoint`** — one run: model-config `overrides` (the state knobs to set at the fixed
+  `d_model`, e.g. `{"d_state": 16}` or `{"gdn2_head_dim": 32, "gdn2_expand_v": 2}`), its peak
+  `lr`, and an optional `label`. State size is derived from the resulting `ModelConfig`, so it
+  is **decoupled from `d_model`** — the x-axis is the recurrent state, not the model width.
 
-Per-mixer defaults for the width sweep and its learning rates live in `DEFAULT_D_MODELS`
-and `DEFAULT_LR_PER_D_MODEL` in `config.py`.
+Per-mixer default sweep points live in `DEFAULT_POINTS` in `config.py`.
 
 Edit those defaults directly, **or** override common knobs without touching files via CLI
 flags / environment variables (handy in Colab). Run any script with `--help`:
 
 ```bash
 python experiments/exp002_mamba2.py --help
-python experiments/exp002_mamba2.py --wandb-mode disabled --d-models 8 32 64
-python experiments/exp002_mamba2.py --d-models 96 128 --lr 5e-4   # custom widths need an LR
-python experiments/exp003_gdn2.py   --mixer mamba2               # swap mixer, keep the harness
+python experiments/exp002_mamba2.py --wandb-mode disabled            # default points
+python experiments/exp002_mamba2.py --d-model 48 --lr 5e-4           # fix a different width + flat LR
+python experiments/exp003_gdn2.py   --mixer mamba2                   # swap mixer, keep the harness
 ```
 
-`--d-models` must use widths present in the experiment's `lr_per_d_model` map; for
-ad-hoc widths pass `--lr` to set a flat peak LR for the whole sweep.
+`--d-model` sets the fixed residual-stream width for the whole sweep; `--lr` overrides every
+point's peak LR. To change which state configurations are swept, edit the `points` list (or
+`DEFAULT_POINTS[mixer]`).
 
 Recognised env vars: `WANDB_MODE` (`online`/`offline`/`disabled`), `WANDB_ENTITY`,
 `WANDB_PROJECT` (CLI flags win over env vars, which win over the script defaults).
@@ -153,8 +158,8 @@ The mixers are a registry (`src/newattn/mixers/`). To add one:
    `state_size(seq_len) -> int` method (element count for one layer).
 2. Provide `build(cfg, layer_idx)`, `state_size_bytes(cfg, n_layers, seq_len)`, and
    `dims_str(cfg)`, plus a module-level `SPEC = MixerSpec(...)`.
-3. Register the `SPEC` in `mixers/__init__.py` and add a default width sweep to
-   `DEFAULT_D_MODELS` in `config.py`.
+3. Register the `SPEC` in `mixers/__init__.py` and add a default state-size sweep
+   (a list of `SweepPoint`s varying the mixer's state knobs) to `DEFAULT_POINTS` in `config.py`.
 
 It then drops straight into the shared model/train/sweep harness.
 
@@ -169,5 +174,5 @@ Mamba2 in particular is an exact O(L²) pure-PyTorch SSD scan, mathematically id
 the chunked kernel for these sequence lengths.
 
 On top of the zoology defaults the training loop adds: a per-step warmup→cosine LR
-schedule whose peak LR is set per width by the experiment's `lr_per_d_model` map, gradient
-clipping, early stopping (solved or plateau), and no weight decay on 1-D parameters.
+schedule whose peak LR is set per run from each `SweepPoint.lr`, gradient clipping, early
+stopping (solved or plateau), and no weight decay on 1-D parameters.

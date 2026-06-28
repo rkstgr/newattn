@@ -1,9 +1,9 @@
 """MQAR exp001b -- Transformer (attention): state size vs. recall accuracy.
 
 Recreates the central Zoology experiment for a decoder-only transformer. State size = KV
-cache = 4 * n_layers * 2 * d_model * seq_len bytes; with the task difficulty fixed,
-`d_model` is the knob that moves us along the x-axis. Attention has effectively unbounded
-state, so accuracy rises with width and saturates near 1.0.
+cache = 4 * n_layers * 2 * d_model * seq_len bytes. Attention has effectively unbounded state
+(it grows with sequence length, not a bounded recurrent knob), so it serves as a single fixed
+baseline at d_model=32 -- the reference accuracy that the sub-quadratic mixers are compared to.
 
 Run:
     python experiments/exp001b_transformer.py                 # online W&B (prompts login)
@@ -13,13 +13,13 @@ Run:
 import _bootstrap  # noqa: F401  (puts ./src on sys.path if newattn isn't installed)
 
 from newattn.cli import run_experiment
-from newattn.config import DEFAULT_D_MODELS, DEFAULT_LR_PER_D_MODEL, SweepConfig
+from newattn.config import DEFAULT_POINTS, SweepConfig
 
 DEFAULTS = SweepConfig(
     mixer="attention",
     exp_id="exp001b",
-    d_models=DEFAULT_D_MODELS["attention"],
-    lr_per_d_model=DEFAULT_LR_PER_D_MODEL["attention"],
+    d_model=32,  # fixed residual-stream width
+    points=DEFAULT_POINTS["attention"],  # single baseline point (attention has no bounded state knob)
     seed=123,
     wandb_project="zoology-mqar",
     wandb_entity=None,  # set to your W&B entity, or pass --wandb-entity / WANDB_ENTITY

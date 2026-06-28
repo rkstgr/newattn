@@ -10,7 +10,9 @@ import argparse
 import copy
 import os
 
-from .config import DEFAULT_D_MODELS, DEFAULT_LR_PER_D_MODEL, SweepConfig
+import dataclasses
+
+from .config import DEFAULT_POINTS, SweepConfig
 from .sweep import run_sweep
 
 
@@ -22,10 +24,10 @@ def _build_parser(defaults: SweepConfig) -> argparse.ArgumentParser:
     p.add_argument("--mixer", choices=["attention", "mamba2", "gdn2", "gdn2_triton", "titans"], default=None,
                    help="sequence mixer (gdn2 = pure-PyTorch, gdn2_triton = fla kernels, "
                         "titans = MLP neural-memory; overrides the experiment default)")
-    p.add_argument("--d-models", type=int, nargs="+", default=None,
-                   help="explicit width sweep (defaults are mixer-specific)")
+    p.add_argument("--d-model", type=int, default=None,
+                   help="fixed residual-stream width for the whole sweep (state size is swept via points)")
     p.add_argument("--lr", type=float, default=None,
-                   help="flat peak LR for every width (overrides the per-d_model map)")
+                   help="flat peak LR for every point (overrides each point's lr)")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--amp-dtype", choices=["bf16", "fp16", "fp32"], default=None,
                    help="autocast dtype for AMP mixers like gdn2 (fp16 for Turing/T4; default bf16)")
@@ -46,15 +48,14 @@ def config_from_args(defaults: SweepConfig, argv=None) -> SweepConfig:
     if args.mixer:
         cfg.mixer = args.mixer
     if args.mixer and args.mixer != defaults.mixer:
-        # switched mixer -> adopt that mixer's default widths + LR map (unless overridden below)
-        cfg.d_models = list(DEFAULT_D_MODELS[args.mixer])
-        cfg.lr_per_d_model = dict(DEFAULT_LR_PER_D_MODEL[args.mixer])
-    if args.d_models is not None:
-        cfg.d_models = args.d_models
+        # switched mixer -> adopt that mixer's default sweep points (unless overridden below)
+        cfg.points = [dataclasses.replace(pt) for pt in DEFAULT_POINTS[args.mixer]]
+    if args.d_model is not None:
+        cfg.d_model = args.d_model
 
-    # --lr sets a flat LR for the whole (possibly overridden) sweep
+    # --lr sets a flat LR for every point in the (possibly overridden) sweep
     if args.lr is not None:
-        cfg.lr_per_d_model = {d: args.lr for d in cfg.d_models}
+        cfg.points = [dataclasses.replace(pt, lr=args.lr) for pt in cfg.points]
 
     if args.seed is not None:
         cfg.seed = args.seed

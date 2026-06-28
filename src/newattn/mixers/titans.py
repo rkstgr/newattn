@@ -21,10 +21,10 @@ per head, *independent of sequence length*. The MLP non-linearity means there is
 closed form, so the scan is an explicit token-by-token loop (as for the gdn2 `fused_recurrent`
 mode); for the MQAR seq_len (128) this is fast and exact.
 
-Like the pure-PyTorch `gdn2` mixer this runs single-head with `head_dim = d_model`
-(`titans_num_heads = 1`) by default, so the state grows quadratically in d_model and d_model is
-the single state-size x-axis knob; set `titans_num_heads > 1` for a multi-head memory with
-`head_dim = d_model // num_heads`.
+`head_dim` (the memory knob) is decoupled from d_model: the q/k/v projections map
+d_model -> num_heads * head_dim, so the recurrent state (~ memory_mult * head_dim^2 per head)
+can be swept independently of the residual-stream width. With `titans_head_dim = None` it falls
+back to `head_dim = d_model // num_heads` (the original single-/multi-head behavior).
 """
 from __future__ import annotations
 
@@ -67,27 +67,32 @@ class Titans(nn.Module):
     """
 
     def __init__(self, d_model: int, num_heads: int = 1, memory_mult: int = 4,
-                 max_inner_lr: float = 0.05, conv_size: int = 4, use_short_conv: bool = True,
-                 layer_idx: int | None = None):
+                 head_dim: int | None = None, max_inner_lr: float = 0.05, conv_size: int = 4,
+                 use_short_conv: bool = True, layer_idx: int | None = None):
         super().__init__()
-        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
         self.d_model = d_model
         self.num_heads = num_heads
-        self.head_dim = d_model // num_heads
+        # head_dim decoupled from d_model; default keeps the original d_model // num_heads.
+        if head_dim is None:
+            assert d_model % num_heads == 0, "d_model must be divisible by num_heads when head_dim is None"
+            head_dim = d_model // num_heads
+        self.head_dim = head_dim
+        self.inner_dim = num_heads * head_dim  # total q/k/v width
         self.memory_hidden = memory_mult * self.head_dim
         self.max_inner_lr = max_inner_lr
         self.use_short_conv = use_short_conv
         self.layer_idx = layer_idx
 
         # q/k/v projections (+ optional short conv with SiLU; else plain SiLU), and output proj.
-        self.q_proj = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj = nn.Linear(d_model, d_model, bias=False)
-        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        # Projections map d_model <-> inner_dim = num_heads * head_dim (decoupled from d_model).
+        self.q_proj = nn.Linear(d_model, self.inner_dim, bias=False)
+        self.k_proj = nn.Linear(d_model, self.inner_dim, bias=False)
+        self.v_proj = nn.Linear(d_model, self.inner_dim, bias=False)
         if use_short_conv:
-            self.q_conv1d = _ShortConv(d_model, conv_size)
-            self.k_conv1d = _ShortConv(d_model, conv_size)
-            self.v_conv1d = _ShortConv(d_model, conv_size)
-        self.o_proj = nn.Linear(d_model, d_model, bias=False)
+            self.q_conv1d = _ShortConv(self.inner_dim, conv_size)
+            self.k_conv1d = _ShortConv(self.inner_dim, conv_size)
+            self.v_conv1d = _ShortConv(self.inner_dim, conv_size)
+        self.o_proj = nn.Linear(self.inner_dim, d_model, bias=False)
 
         # Per-head inner-loop gates (computed from the raw input, as in the reference):
         #   beta  = max_inner_lr * sigmoid(x @ Wbeta)          -- inner learning rate
@@ -183,25 +188,30 @@ class Titans(nn.Module):
 def build(cfg, layer_idx: int) -> nn.Module:
     return Titans(
         cfg.d_model, num_heads=cfg.titans_num_heads, memory_mult=cfg.titans_memory_mult,
-        max_inner_lr=cfg.titans_max_inner_lr, conv_size=cfg.titans_conv_size,
-        use_short_conv=cfg.titans_use_short_conv, layer_idx=layer_idx,
+        head_dim=cfg.titans_head_dim, max_inner_lr=cfg.titans_max_inner_lr,
+        conv_size=cfg.titans_conv_size, use_short_conv=cfg.titans_use_short_conv, layer_idx=layer_idx,
     )
+
+
+def _titans_head_dim(cfg) -> int:
+    """head_dim = titans_head_dim, or d_model // num_heads when decoupled knob is unset."""
+    return cfg.titans_head_dim if cfg.titans_head_dim is not None else cfg.d_model // cfg.titans_num_heads
 
 
 def state_size_bytes(cfg, n_layers: int, seq_len: int) -> int:
     """Closed form of LanguageModel.state_size for Titans:
-    4 * n_layers * num_heads * 2 * head_dim * mem_hidden  (head_dim = d_model // num_heads,
-    mem_hidden = memory_mult * head_dim). With the default single head this is
-    8 * memory_mult * n_layers * d_model**2.
+    4 * n_layers * num_heads * 2 * head_dim * mem_hidden  (head_dim = titans_head_dim or
+    d_model // num_heads, mem_hidden = memory_mult * head_dim). With a single head this is
+    8 * memory_mult * n_layers * head_dim**2 -- independent of d_model.
 
     Independent of sequence length (bounded recurrent fast-weight state)."""
-    head_dim = cfg.d_model // cfg.titans_num_heads
+    head_dim = _titans_head_dim(cfg)
     mem_hidden = cfg.titans_memory_mult * head_dim
     return 4 * n_layers * cfg.titans_num_heads * 2 * head_dim * mem_hidden
 
 
 def dims_str(cfg) -> str:
-    head_dim = cfg.d_model // cfg.titans_num_heads
+    head_dim = _titans_head_dim(cfg)
     mem_hidden = cfg.titans_memory_mult * head_dim
     return f"num_heads={cfg.titans_num_heads:>3d}  head_dim={head_dim:>3d}  mem_hidden={mem_hidden:>4d}"
 

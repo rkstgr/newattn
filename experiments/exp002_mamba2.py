@@ -3,8 +3,8 @@
 The Mamba2 counterpart of exp001b: same MQAR task and harness, but the MHA mixer is
 replaced by a pure-PyTorch Mamba2 SSM (no CUDA kernels -- runs on CPU or GPU). State size
 = 4 * n_layers * (expand * d_model) * d_state bytes, *independent of sequence length*
-(bounded recurrent state). Accuracy is therefore capped by state size and rises toward 1.0
-as the state grows -- the headline zoology recall-vs-state curve for sub-quadratic mixers.
+(bounded recurrent state). The state is swept via the SSM state dim `d_state` at a fixed
+d_model=32, so accuracy is plotted against state size decoupled from the residual-stream width.
 
 Run:
     python experiments/exp002_mamba2.py
@@ -14,13 +14,13 @@ Run:
 import _bootstrap  # noqa: F401  (puts ./src on sys.path if newattn isn't installed)
 
 from newattn.cli import run_experiment
-from newattn.config import DEFAULT_D_MODELS, DEFAULT_LR_PER_D_MODEL, SweepConfig
+from newattn.config import DEFAULT_POINTS, SweepConfig
 
 DEFAULTS = SweepConfig(
     mixer="mamba2",
     exp_id="exp002",
-    d_models=DEFAULT_D_MODELS["mamba2"],  # [8, 16, 32, 48, 64]
-    lr_per_d_model=DEFAULT_LR_PER_D_MODEL["mamba2"],  # {8:3e-3, 16:2e-3, 32:1e-3, 48:1e-3, 64:8e-4}
+    d_model=32,  # fixed residual-stream width; state size is swept via points
+    points=DEFAULT_POINTS["mamba2"],  # d_state in {4, 8, 16, 32, 64, 128}
     seed=123,
     wandb_project="zoology-mqar",
     wandb_entity=None,  # set to your W&B entity, or pass --wandb-entity / WANDB_ENTITY

@@ -104,6 +104,15 @@ class ModelConfig:
     titans_conv_size: int = 4
     titans_mode: str = "recurrent"  # "recurrent" (exact per-token loop) | "chunk" (faster mini-batch)
     titans_chunk_size: int = 8  # chunk length for titans_mode="chunk" (mini-batch GD approximation)
+    # ---- Titans inner-loop stabilization (off by default == exp004 baseline; exp005 turns these on) ----
+    # The inner test-time GD step is stable only when beta*||h||^2 < 2; ||h||^2 scales with mem_hidden
+    # (= memory_mult * head_dim), so wider memory (e.g. hd16m4) diverges to NaN under a fixed inner LR.
+    # These two knobs decouple the step from gradient norm / curvature / state width, following the
+    # recent norm-constrained test-time-training literature (LaCT arXiv:2505.23884, Atlas
+    # arXiv:2505.23735, Hyperball arXiv:2603.28743, Muon/Scion arXiv:2502.07529).
+    titans_update_norm: str = "none"  # inner-update direction normalization: "none" | "frobenius"
+    titans_weight_norm: bool = False  # cap fast-weight Frobenius norm at its home (init) norm (ball projection)
+    titans_update_eps: float = 1e-3  # eps floor for the inner-gradient / q,k normalization (a real floor damps near convergence)
 
     # ---- shared ----
     mlp_hidden_mult: int = 4

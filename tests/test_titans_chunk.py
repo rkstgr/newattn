@@ -51,6 +51,48 @@ def test_titans_chunk_finite():
         assert torch.isfinite(g).all(), f"hd={head_dim} mm={mm}: non-finite chunk grad"
 
 
+def test_titans_stable_chunk1_equals_recurrent():
+    """The stabilized inner loop (exp005: gradient-norm + weight-ball) still satisfies chunk1==loop."""
+    torch.manual_seed(0)
+    for head_dim, mm in [(16, 2), (16, 4), (32, 4)]:
+        m = Titans(d_model=32, num_heads=1, memory_mult=mm, head_dim=head_dim,
+                   update_norm="frobenius", weight_norm=True)
+        x = torch.randn(4, 128, 32)
+        m.mode = "recurrent"
+        o_ref = m(x)
+        m.mode, m.chunk_size = "chunk", 1
+        max_diff = (o_ref - m(x)).abs().max().item()
+        assert max_diff < 1e-4, f"stable hd={head_dim} mm={mm}: chunk1 vs loop diff {max_diff:.2e}"
+
+
+def test_titans_stable_finite_in_blowup_regime():
+    """In the high-curvature regime (||h||^2 >> 1) where the wide-memory baseline diverges to NaN,
+    the exp005 stabilization (frobenius update-norm + weight ball) keeps fwd+bwd finite.
+
+    Reproduces the hd16m4 failure mode directly by scaling the fast-weight init so beta*||h||^2 >> 2
+    from the first token, instead of waiting ~1360 training steps for the projections to grow."""
+    torch.manual_seed(0)
+
+    def build(stabilize):
+        kw = dict(update_norm="frobenius", weight_norm=True) if stabilize else {}
+        m = Titans(d_model=32, num_heads=1, memory_mult=4, head_dim=16,
+                   mode="chunk", chunk_size=8, **kw)
+        with torch.no_grad():  # push the memory MLP into the divergent high-curvature regime
+            m.mem_W1 *= 6.0
+            m.mem_W2 *= 6.0
+        return m
+
+    x = torch.randn(4, 128, 32)
+    base = build(False)(x)
+    assert not torch.isfinite(base).all(), "baseline should blow up here (else the test no longer exercises the bug)"
+
+    xs = x.clone().requires_grad_(True)
+    out = build(True)(xs)
+    assert torch.isfinite(out).all(), "stabilized chunk output should stay finite"
+    g = torch.autograd.grad(out.sum(), xs)[0]
+    assert torch.isfinite(g).all(), "stabilized chunk grad should stay finite"
+
+
 def test_titans_chunk_odd_length():
     """Sequence length not divisible by chunk_size (pad path) preserves length and the chunk1 match."""
     torch.manual_seed(0)
@@ -82,6 +124,7 @@ def test_gdn2_chunk_matches_recurrent():
 
 if __name__ == "__main__":
     for fn in [test_titans_chunk1_equals_recurrent, test_titans_chunk_finite,
+               test_titans_stable_chunk1_equals_recurrent, test_titans_stable_finite_in_blowup_regime,
                test_titans_chunk_odd_length, test_gdn2_chunk_matches_recurrent]:
         fn()
         print(f"PASS  {fn.__name__}")

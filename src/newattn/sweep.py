@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import uuid
 
+import torch
+
 from .config import ModelConfig, SweepConfig
 from .data import build_dataloaders
 from .determinism import get_device, set_determinism
@@ -82,10 +84,20 @@ def run_sweep(cfg: SweepConfig) -> list[dict]:
         # data (identical task across runs) + model
         train_dl, test_dl, fingerprint = build_dataloaders(
             cfg.task, seed=cfg.seed, batch_size=cfg.train.batch_size,
-            test_batch_size=cfg.train.test_batch_size)
+            test_batch_size=cfg.train.test_batch_size, drop_last=cfg.train.compile)
         model_cfg = ModelConfig(d_model=d_model, mixer=cfg.mixer, vocab_size=cfg.task.vocab_size,
                                 max_position_embeddings=cfg.task.input_seq_len, **overrides)
         model = LanguageModel(model_cfg)
+
+        # torch.compile: Inductor fuses the per-token mixer loops + CUDA graphs eliminate launch
+        # overhead (a big win for titans). Skip the fla Triton mixer (its kernels conflict with
+        # compile); fall back to eager if compilation fails. Lazy, so wrapping before .to(device).
+        if cfg.train.compile and device == "cuda" and not spec.requires_cuda:
+            try:
+                model = torch.compile(model, mode=cfg.train.compile_mode)
+                print(f"  torch.compile enabled (mode={cfg.train.compile_mode!r}).")
+            except Exception as e:  # pragma: no cover - host-dependent
+                print(f"  torch.compile failed ({e}); falling back to eager.")
 
         num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         state_size = model.state_size(sequence_length=cfg.task.input_seq_len)

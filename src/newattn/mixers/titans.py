@@ -68,7 +68,8 @@ class Titans(nn.Module):
 
     def __init__(self, d_model: int, num_heads: int = 1, memory_mult: int = 4,
                  head_dim: int | None = None, max_inner_lr: float = 0.05, conv_size: int = 4,
-                 use_short_conv: bool = True, layer_idx: int | None = None):
+                 use_short_conv: bool = True, mode: str = "recurrent", chunk_size: int = 64,
+                 layer_idx: int | None = None):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
@@ -81,6 +82,8 @@ class Titans(nn.Module):
         self.memory_hidden = memory_mult * self.head_dim
         self.max_inner_lr = max_inner_lr
         self.use_short_conv = use_short_conv
+        self.mode = mode
+        self.chunk_size = chunk_size
         self.layer_idx = layer_idx
 
         # q/k/v projections (+ optional short conv with SiLU; else plain SiLU), and output proj.
@@ -135,7 +138,6 @@ class Titans(nn.Module):
         return q, k, v, beta, nu, alpha
 
     def forward(self, hidden_states):
-        B, T, _ = hidden_states.shape
         q, k, v, beta, nu, alpha = self._project(hidden_states)
 
         # Run the inner-loop recurrence in fp32 for stable test-time gradient steps.
@@ -143,13 +145,24 @@ class Titans(nn.Module):
         q, k, v = q.float(), k.float(), v.float()
         beta, nu, alpha = beta.float(), nu.float(), alpha.float()  # (b, l, h)
 
+        if self.mode == "chunk":
+            out = self._chunk_scan(q, k, v, beta, nu, alpha)  # (b, h, l, head_dim)
+        else:
+            out = self._recurrent_scan(q, k, v, beta, nu, alpha)
+
+        out = rearrange(out, "b h l d -> b l (h d)").to(out_dtype)
+        return self.o_proj(out)
+
+    def _recurrent_scan(self, q, k, v, beta, nu, alpha):
+        """Exact token-by-token inner-loop scan. q/k/v: (b, h, l, head_dim); gates: (b, l, h)."""
+        B, _, T, _ = q.shape
         # Per-(batch, head) memory state, reset to the learned init each sequence.
         W1 = self.mem_W1.float().expand(B, -1, -1, -1).clone()  # (b, h, head_dim, mem_hidden)
         W2 = self.mem_W2.float().expand(B, -1, -1, -1).clone()  # (b, h, mem_hidden, head_dim)
         mW1 = torch.zeros_like(W1)
         mW2 = torch.zeros_like(W2)
 
-        outs = []
+        out = q.new_empty(B, self.num_heads, T, self.head_dim)
         for t in range(T):
             q_t, k_t, v_t = q[:, :, t], k[:, :, t], v[:, :, t]  # (b, h, head_dim)
             beta_t = beta[:, t, :, None, None]                  # (b, h, 1, 1)
@@ -171,12 +184,82 @@ class Titans(nn.Module):
             W2 = alpha_t * W2 - beta_t * mW2
 
             pre_q = torch.einsum("bhd,bhde->bhe", q_t, W1)
-            o_t = torch.einsum("bhe,bhed->bhd", F.silu(pre_q), W2)  # (b, h, head_dim)
-            outs.append(o_t)
+            out[:, :, t] = torch.einsum("bhe,bhed->bhd", F.silu(pre_q), W2)  # (b, h, head_dim)
+        return out
 
-        out = torch.stack(outs, dim=2)  # (b, h, l, head_dim)
-        out = rearrange(out, "b h l d -> b l (h d)").to(out_dtype)
-        return self.o_proj(out)
+    def _chunk_scan(self, q, k, v, beta, nu, alpha):
+        """Chunked mini-batch scan: process `chunk_size` tokens at once with batched matmuls.
+
+        The only approximation vs `_recurrent_scan` is that the inner-loop gradients within a chunk
+        are taken at the *chunk-start* weights (the TTT/Titans "mini-batch gradient descent" form);
+        the momentum + weight-decay recurrence is then applied exactly via cumulative-decay sums.
+        With chunk_size=1 this is identical to the per-token loop. q/k/v: (b, h, l, d); gates (b, l, h).
+        """
+        B, H, T, Dk = q.shape
+        Dm = self.memory_hidden
+        C = min(self.chunk_size, T)
+        pad = (C - T % C) % C
+        if pad:  # pad the end of the sequence so T is a multiple of C (sliced off at the end)
+            q, k, v = (F.pad(x, (0, 0, 0, pad)) for x in (q, k, v))          # (b, h, l, d) -> pad l
+            beta, nu, alpha = (F.pad(x, (0, 0, 0, pad)) for x in (beta, nu, alpha))  # (b, l, h) -> pad l
+        Tp = q.shape[2]
+        NT = Tp // C
+
+        qc, kc, vc = (x.view(B, H, NT, C, Dk) for x in (q, k, v))            # (b, h, nt, c, d)
+        # gates (b, l, h) -> (b, h, nt, c)
+        betac, nuc, alphac = (x.view(B, NT, C, H).permute(0, 3, 1, 2) for x in (beta, nu, alpha))
+
+        # Per-chunk cumulative log-decays (bounded: nu, alpha in (0, 1] -> cum <= 0, exp <= 1).
+        cumnu = nuc.clamp_min(1e-6).log().cumsum(-1)    # (b, h, nt, c)
+        cumal = alphac.clamp_min(1e-6).log().cumsum(-1)
+
+        tril = torch.tril(torch.ones(C, C, device=q.device, dtype=torch.bool))  # lower incl diagonal
+
+        def decay_coef(cum_n):  # coef[i, j] = exp(cum_i - cum_j) for j <= i else 0  (j>i masked pre-exp)
+            diff = cum_n.unsqueeze(-1) - cum_n.unsqueeze(-2)        # (b, h, i, j)
+            return diff.masked_fill(~tril, 0.0).exp().masked_fill(~tril, 0.0)
+
+        # Carried memory state, reset to the learned init each sequence.
+        W1 = self.mem_W1.float().expand(B, -1, -1, -1).clone()  # (b, h, d, m)
+        W2 = self.mem_W2.float().expand(B, -1, -1, -1).clone()  # (b, h, m, d)
+        mW1 = torch.zeros_like(W1)
+        mW2 = torch.zeros_like(W2)
+
+        out = q.new_empty(B, H, Tp, Dk)
+        for n in range(NT):
+            q_n, k_n, v_n = qc[:, :, n], kc[:, :, n], vc[:, :, n]   # (b, h, c, d)
+            beta_n = betac[:, :, n]                                 # (b, h, c)
+            An = cumnu[:, :, n].exp()[..., None, None]              # (b, h, c, 1, 1) carry decay (momentum)
+            Bn = cumal[:, :, n].exp()[..., None, None]              # (b, h, c, 1, 1) carry decay (weights)
+            coefM, coefW = decay_coef(cumnu[:, :, n]), decay_coef(cumal[:, :, n])
+
+            # Inner-loop gradients of ||MLP_k(k) - v||^2 at the chunk-start weights (all tokens at once).
+            pre = torch.einsum("bhcd,bhde->bhce", k_n, W1)         # (b, h, c, m)
+            hsil = F.silu(pre)
+            pred = torch.einsum("bhce,bhed->bhcd", hsil, W2)       # (b, h, c, d)
+            res = v_n - pred
+            gW2 = -torch.einsum("bhce,bhcd->bhced", hsil, res)     # (b, h, c, m, d)
+            herr = torch.einsum("bhed,bhcd->bhce", W2, res) * silu_grad(pre)  # (b, h, c, m)
+            gW1 = -torch.einsum("bhcd,bhce->bhcde", k_n, herr)     # (b, h, c, d, m)
+
+            # Momentum: mW_i = sum_{j<=i} coefM[i,j] gW_j + (prod nu) * mW_carry.
+            mW1n = torch.einsum("bhij,bhjde->bhide", coefM, gW1) + An * mW1.unsqueeze(2)
+            mW2n = torch.einsum("bhij,bhjed->bhied", coefM, gW2) + An * mW2.unsqueeze(2)
+            # Weights: W_i = (prod alpha) * W_carry - sum_{j<=i} coefW[i,j] beta_j mW_j.
+            bmW1 = beta_n[..., None, None] * mW1n                  # (b, h, c, d, m)
+            bmW2 = beta_n[..., None, None] * mW2n
+            W1i = Bn * W1.unsqueeze(2) - torch.einsum("bhij,bhjde->bhide", coefW, bmW1)  # (b, h, c, d, m)
+            W2i = Bn * W2.unsqueeze(2) - torch.einsum("bhij,bhjed->bhied", coefW, bmW2)  # (b, h, c, m, d)
+
+            # Read each token with its own updated memory.
+            pre_q = torch.einsum("bhcd,bhcde->bhce", q_n, W1i)     # (b, h, c, m)
+            out[:, :, n * C:(n + 1) * C] = torch.einsum("bhce,bhced->bhcd", F.silu(pre_q), W2i)
+
+            # Carry the final (full) memory + momentum state into the next chunk.
+            W1, W2 = W1i[:, :, -1], W2i[:, :, -1]
+            mW1, mW2 = mW1n[:, :, -1], mW2n[:, :, -1]
+
+        return out[:, :, :T]
 
     def state_size(self, sequence_length: int = 2048) -> int:
         # Fast-weight memory per head: W1 (head_dim, mem_hidden) + W2 (mem_hidden, head_dim).
@@ -189,7 +272,8 @@ def build(cfg, layer_idx: int) -> nn.Module:
     return Titans(
         cfg.d_model, num_heads=cfg.titans_num_heads, memory_mult=cfg.titans_memory_mult,
         head_dim=cfg.titans_head_dim, max_inner_lr=cfg.titans_max_inner_lr,
-        conv_size=cfg.titans_conv_size, use_short_conv=cfg.titans_use_short_conv, layer_idx=layer_idx,
+        conv_size=cfg.titans_conv_size, use_short_conv=cfg.titans_use_short_conv,
+        mode=cfg.titans_mode, chunk_size=cfg.titans_chunk_size, layer_idx=layer_idx,
     )
 
 

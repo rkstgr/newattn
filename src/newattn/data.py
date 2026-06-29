@@ -78,11 +78,15 @@ def multiquery_ar(
     return inputs, labels
 
 
-def build_dataloaders(task: MQARTaskConfig, seed: int, batch_size: int, test_batch_size: int):
+def build_dataloaders(task: MQARTaskConfig, seed: int, batch_size: int, test_batch_size: int,
+                      drop_last: bool = False):
     """Build reproducible train/test loaders with disjoint train/test seeds.
 
     Returns (train_dl, test_dl, fingerprint) where `fingerprint` is an md5 of the test
     set, so dataset identity is verifiable across machines.
+
+    `drop_last` drops the ragged final *train* batch so every train step has the same shape
+    -- required for torch.compile's CUDA-graph (`reduce-overhead`) capture.
     """
     MAX_SEED = 2 ** 32
     rng = np.random.RandomState(seed)
@@ -108,6 +112,7 @@ def build_dataloaders(task: MQARTaskConfig, seed: int, batch_size: int, test_bat
     test_ds = torch.utils.data.TensorDataset(test_inputs, test_labels)
 
     g = torch.Generator().manual_seed(seed)  # reproducible shuffling
-    train_dl = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, generator=g)
+    train_dl = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                                           generator=g, drop_last=drop_last)
     test_dl = torch.utils.data.DataLoader(test_ds, batch_size=test_batch_size, shuffle=False)
     return train_dl, test_dl, fingerprint

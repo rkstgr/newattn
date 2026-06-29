@@ -102,6 +102,8 @@ class ModelConfig:
     titans_max_inner_lr: float = 0.05  # cap on the inner-loop (test-time) learning rate beta
     titans_use_short_conv: bool = True  # short causal conv on q/k/v (as in the reference)
     titans_conv_size: int = 4
+    titans_mode: str = "recurrent"  # "recurrent" (exact per-token loop) | "chunk" (faster mini-batch)
+    titans_chunk_size: int = 8  # chunk length for titans_mode="chunk" (mini-batch GD approximation)
 
     # ---- shared ----
     mlp_hidden_mult: int = 4
@@ -144,6 +146,8 @@ class TrainParams:
     warmup_epochs: float = 1.0  # linear LR warmup over this many epochs
     grad_clip: float = 1.0  # max gradient norm (<= 0 disables clipping)
     amp_dtype: str = "bfloat16"  # autocast dtype when use_amp: "bf16"/"fp16"/"fp32" (fp16 for Turing/T4)
+    compile: bool = False  # torch.compile the model (Inductor + CUDA graphs) -- big win for titans
+    compile_mode: str = "reduce-overhead"  # torch.compile mode (CUDA graphs); "default" is more robust
     early_stopping_metric: str = "valid/accuracy"
     early_stopping_threshold: float = 0.99  # stop early once the task is solved
     patience: int = 5  # stop if valid/accuracy hasn't improved for N epochs

@@ -31,6 +31,12 @@ def _build_parser(defaults: SweepConfig) -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--amp-dtype", choices=["bf16", "fp16", "fp32"], default=None,
                    help="autocast dtype for AMP mixers like gdn2 (fp16 for Turing/T4; default bf16)")
+    p.add_argument("--compile", dest="compile", action=argparse.BooleanOptionalAction, default=None,
+                   help="torch.compile the model (Inductor + CUDA graphs); big speedup, esp. for titans")
+    p.add_argument("--mode", choices=["recurrent", "chunk"], default=None,
+                   help="titans inner-loop scan: 'recurrent' (exact per-token) or 'chunk' (faster mini-batch)")
+    p.add_argument("--chunk-size", type=int, default=None,
+                   help="chunk length when --mode=chunk (smaller = closer to exact)")
     p.add_argument("--max-epochs", type=int, default=None)
     p.add_argument("--num-train-examples", type=int, default=None, help="handy for a quick smoke test")
     p.add_argument("--num-test-examples", type=int, default=None)
@@ -62,6 +68,13 @@ def config_from_args(defaults: SweepConfig, argv=None) -> SweepConfig:
         cfg.train.seed = args.seed
     if args.amp_dtype is not None:
         cfg.train.amp_dtype = args.amp_dtype
+    if args.compile is not None:
+        cfg.train.compile = args.compile
+    # titans chunked-scan knobs apply to every point (merged under each point's ModelConfig)
+    if args.mode is not None:
+        cfg.model_overrides["titans_mode"] = args.mode
+    if args.chunk_size is not None:
+        cfg.model_overrides["titans_chunk_size"] = args.chunk_size
     if args.max_epochs is not None:
         cfg.train.max_epochs = args.max_epochs
     if args.num_train_examples is not None:

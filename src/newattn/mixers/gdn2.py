@@ -93,9 +93,14 @@ def naive_chunk_gdn2(q, k, v, g, b, w, scale=None, initial_state=None, output_fi
     k_g = k * g_cum.exp()
     k_g_b = k_g * b
 
-    decay_ij = (g_cum.unsqueeze(-2) - g_cum.unsqueeze(-3))
-    decay_ij_exp = decay_ij.exp()
     tril_mask = torch.tril(torch.ones(BT, BT, device=q.device, dtype=torch.bool), diagonal=-1)
+    # Mask the non-causal (strictly-upper) decay differences to 0 BEFORE exp: there
+    # g_cum[i] - g_cum[j] (i < j) is a large positive number that overflows exp() to +inf.
+    # The forward masks those entries out of T_lower anyway, but leaving the inf in the graph
+    # makes the backward compute 0 * inf = nan on the g_cum gradient. Masking first keeps the
+    # causal entries unchanged while making the exp finite everywhere.
+    decay_ij = (g_cum.unsqueeze(-2) - g_cum.unsqueeze(-3)).masked_fill(~tril_mask[..., None], 0.0)
+    decay_ij_exp = decay_ij.exp()
     bk = b * k
     T_lower = torch.einsum('bhnik,bhnjk,bhnijk->bhnij', bk, k, decay_ij_exp)
     T_lower = T_lower.masked_fill(~tril_mask, 0.0)
@@ -111,8 +116,10 @@ def naive_chunk_gdn2(q, k, v, g, b, w, scale=None, initial_state=None, output_fi
     w_wy = A_inv @ k_g_b
     k_tail = k * (g_last - g_cum).exp()
 
-    decay_qk = (g_cum.unsqueeze(-2) - g_cum.unsqueeze(-3)).exp()
     causal_mask = torch.tril(torch.ones(BT, BT, device=q.device, dtype=torch.bool), diagonal=0)
+    # Same guard as decay_ij: mask the non-causal half to 0 before exp so the (later masked-out)
+    # upper triangle never overflows to +inf and poisons the backward with 0 * inf = nan.
+    decay_qk = (g_cum.unsqueeze(-2) - g_cum.unsqueeze(-3)).masked_fill(~causal_mask[..., None], 0.0).exp()
 
     S = torch.zeros(B, H, K, V, device=v.device, dtype=torch.float32)
     if initial_state is not None:

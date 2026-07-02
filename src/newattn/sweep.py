@@ -9,6 +9,7 @@ re-evaluation (`cfg.out_dir`; weights also uploaded to W&B).
 """
 from __future__ import annotations
 
+import gc
 import json
 import os
 import uuid
@@ -205,6 +206,15 @@ def run_sweep(cfg: SweepConfig, *, plot: bool = True) -> list[dict]:
             "valid_best_accuracy": metrics["valid/best_accuracy"],
             "evals": evals,
         })
+
+        # Release this run's GPU footprint (params, grads, cached blocks) before the next point;
+        # a compiled run's CUDA-graph pools are only returned by a dynamo reset.
+        del model, train_dl, test_dl
+        if device == "cuda":
+            if cfg.train.compile:
+                torch._dynamo.reset()
+            gc.collect()
+            torch.cuda.empty_cache()
 
     print("\nSweep complete.")
     for r in results:

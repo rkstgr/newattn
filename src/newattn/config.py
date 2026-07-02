@@ -135,6 +135,10 @@ class ModelConfig:
     titans_update_norm: str = "none"  # inner-update direction normalization: "none" | "frobenius"
     titans_weight_norm: bool = False  # cap fast-weight Frobenius norm at its home (init) norm (ball projection)
     titans_update_eps: float = 1e-3  # eps floor for the inner-gradient / q,k normalization (a real floor damps near convergence)
+    # Gradient-checkpoint each chunk of the mini-batch scan: keep only chunk-boundary states and
+    # recompute the per-token fast-weight tensors in backward. Numerically identical; ~10x less
+    # activation memory (hd32m4 @ batch 256: ~13 GB -> fits a 16 GB T4) for one extra chunk forward.
+    titans_checkpoint_chunks: bool = True
 
     # ---- shared ----
     mlp_hidden_mult: int = 4

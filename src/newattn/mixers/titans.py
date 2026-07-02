@@ -32,6 +32,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from torch.utils.checkpoint import checkpoint
 
 from .base import MixerSpec
 
@@ -70,7 +71,7 @@ class Titans(nn.Module):
                  head_dim: int | None = None, max_inner_lr: float = 0.05, conv_size: int = 4,
                  use_short_conv: bool = True, mode: str = "recurrent", chunk_size: int = 64,
                  update_norm: str = "none", weight_norm: bool = False, update_eps: float = 1e-3,
-                 layer_idx: int | None = None):
+                 checkpoint_chunks: bool = True, layer_idx: int | None = None):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
@@ -85,6 +86,7 @@ class Titans(nn.Module):
         self.use_short_conv = use_short_conv
         self.mode = mode
         self.chunk_size = chunk_size
+        self.checkpoint_chunks = checkpoint_chunks
         # Inner-loop stabilization (see config). "none"+False reproduces the exp004 baseline exactly.
         assert update_norm in ("none", "frobenius"), f"unknown titans update_norm {update_norm!r}"
         self.update_norm = update_norm
@@ -235,6 +237,35 @@ class Titans(nn.Module):
             out[:, :, t] = torch.einsum("bhe,bhed->bhd", F.silu(pre_q), W2)  # (b, h, head_dim)
         return out
 
+    def _chunk_step(self, q_n, k_n, v_n, beta_n, An, Bn, coefM, coefW, W1, W2, mW1, mW2,
+                    w1_home, w2_home):
+        """One mini-batch chunk of the scan. Returns (out_chunk, W1, W2, mW1, mW2) where the
+        states are the carries from the chunk's last token. Run under gradient checkpointing
+        (see `_chunk_scan`): the (b, h, c, d, m) per-token weight tensors created here dominate
+        training memory, so they are recomputed in backward instead of stored."""
+        # Inner-loop gradients of ||MLP_k(k) - v||^2 at the chunk-start weights (all tokens at once).
+        pre = torch.einsum("bhcd,bhde->bhce", k_n, W1)         # (b, h, c, m)
+        hsil = F.silu(pre)
+        pred = torch.einsum("bhce,bhed->bhcd", hsil, W2)       # (b, h, c, d)
+        res = v_n - pred
+        gW2 = self._norm_grad(-torch.einsum("bhce,bhcd->bhced", hsil, res))     # (b, h, c, m, d)
+        herr = torch.einsum("bhed,bhcd->bhce", W2, res) * silu_grad(pre)  # (b, h, c, m)
+        gW1 = self._norm_grad(-torch.einsum("bhcd,bhce->bhcde", k_n, herr))     # (b, h, c, d, m)
+
+        # Momentum: mW_i = sum_{j<=i} coefM[i,j] gW_j + (prod nu) * mW_carry.
+        mW1n = torch.einsum("bhij,bhjde->bhide", coefM, gW1) + An * mW1.unsqueeze(2)
+        mW2n = torch.einsum("bhij,bhjed->bhied", coefM, gW2) + An * mW2.unsqueeze(2)
+        # Weights: W_i = (prod alpha) * W_carry - sum_{j<=i} coefW[i,j] beta_j mW_j.
+        bmW1 = beta_n[..., None, None] * mW1n                  # (b, h, c, d, m)
+        bmW2 = beta_n[..., None, None] * mW2n
+        W1i = self._ball(Bn * W1.unsqueeze(2) - torch.einsum("bhij,bhjde->bhide", coefW, bmW1), w1_home)
+        W2i = self._ball(Bn * W2.unsqueeze(2) - torch.einsum("bhij,bhjed->bhied", coefW, bmW2), w2_home)
+
+        # Read each token with its own updated memory.
+        pre_q = torch.einsum("bhcd,bhcde->bhce", q_n, W1i)     # (b, h, c, m)
+        out_n = torch.einsum("bhce,bhced->bhcd", F.silu(pre_q), W2i)
+        return out_n, W1i[:, :, -1], W2i[:, :, -1], mW1n[:, :, -1], mW2n[:, :, -1]
+
     def _chunk_scan(self, q, k, v, beta, nu, alpha):
         """Chunked mini-batch scan: process `chunk_size` tokens at once with batched matmuls.
 
@@ -242,9 +273,14 @@ class Titans(nn.Module):
         are taken at the *chunk-start* weights (the TTT/Titans "mini-batch gradient descent" form);
         the momentum + weight-decay recurrence is then applied exactly via cumulative-decay sums.
         With chunk_size=1 this is identical to the per-token loop. q/k/v: (b, h, l, d); gates (b, l, h).
+
+        With `checkpoint_chunks` (default), each chunk step is gradient-checkpointed: autograd keeps
+        only the chunk-boundary states and recomputes the step's per-token weight tensors in
+        backward. Those tensors -- ~16 of (b, h, c, d, m) per chunk -- are what OOMed wide-memory
+        points (hd32m4: ~13 GB at batch 256 on a 16 GB T4); checkpointed, the same forward holds
+        ~1 GB for one extra scan's worth of recompute.
         """
         B, H, T, Dk = q.shape
-        Dm = self.memory_hidden
         C = min(self.chunk_size, T)
         pad = (C - T % C) % C
         if pad:  # pad the end of the sequence so T is a multiple of C (sliced off at the end)
@@ -274,41 +310,22 @@ class Titans(nn.Module):
         mW2 = torch.zeros_like(W2)
         w1_home, w2_home = self._home_norms(extra_dims=1)  # (1, h, 1, 1, 1) each; only used if weight_norm
 
-        out = q.new_empty(B, H, Tp, Dk)
+        use_ckpt = self.checkpoint_chunks and torch.is_grad_enabled()
+        outs = []
         for n in range(NT):
-            q_n, k_n, v_n = qc[:, :, n], kc[:, :, n], vc[:, :, n]   # (b, h, c, d)
-            beta_n = betac[:, :, n]                                 # (b, h, c)
-            An = cumnu[:, :, n].exp()[..., None, None]              # (b, h, c, 1, 1) carry decay (momentum)
-            Bn = cumal[:, :, n].exp()[..., None, None]              # (b, h, c, 1, 1) carry decay (weights)
-            coefM, coefW = decay_coef(cumnu[:, :, n]), decay_coef(cumal[:, :, n])
+            args = (qc[:, :, n], kc[:, :, n], vc[:, :, n],           # (b, h, c, d)
+                    betac[:, :, n],                                  # (b, h, c)
+                    cumnu[:, :, n].exp()[..., None, None],           # (b, h, c, 1, 1) carry decay (momentum)
+                    cumal[:, :, n].exp()[..., None, None],           # (b, h, c, 1, 1) carry decay (weights)
+                    decay_coef(cumnu[:, :, n]), decay_coef(cumal[:, :, n]),
+                    W1, W2, mW1, mW2, w1_home, w2_home)
+            if use_ckpt:
+                out_n, W1, W2, mW1, mW2 = checkpoint(self._chunk_step, *args, use_reentrant=False)
+            else:
+                out_n, W1, W2, mW1, mW2 = self._chunk_step(*args)
+            outs.append(out_n)
 
-            # Inner-loop gradients of ||MLP_k(k) - v||^2 at the chunk-start weights (all tokens at once).
-            pre = torch.einsum("bhcd,bhde->bhce", k_n, W1)         # (b, h, c, m)
-            hsil = F.silu(pre)
-            pred = torch.einsum("bhce,bhed->bhcd", hsil, W2)       # (b, h, c, d)
-            res = v_n - pred
-            gW2 = self._norm_grad(-torch.einsum("bhce,bhcd->bhced", hsil, res))     # (b, h, c, m, d)
-            herr = torch.einsum("bhed,bhcd->bhce", W2, res) * silu_grad(pre)  # (b, h, c, m)
-            gW1 = self._norm_grad(-torch.einsum("bhcd,bhce->bhcde", k_n, herr))     # (b, h, c, d, m)
-
-            # Momentum: mW_i = sum_{j<=i} coefM[i,j] gW_j + (prod nu) * mW_carry.
-            mW1n = torch.einsum("bhij,bhjde->bhide", coefM, gW1) + An * mW1.unsqueeze(2)
-            mW2n = torch.einsum("bhij,bhjed->bhied", coefM, gW2) + An * mW2.unsqueeze(2)
-            # Weights: W_i = (prod alpha) * W_carry - sum_{j<=i} coefW[i,j] beta_j mW_j.
-            bmW1 = beta_n[..., None, None] * mW1n                  # (b, h, c, d, m)
-            bmW2 = beta_n[..., None, None] * mW2n
-            W1i = self._ball(Bn * W1.unsqueeze(2) - torch.einsum("bhij,bhjde->bhide", coefW, bmW1), w1_home)
-            W2i = self._ball(Bn * W2.unsqueeze(2) - torch.einsum("bhij,bhjed->bhied", coefW, bmW2), w2_home)
-
-            # Read each token with its own updated memory.
-            pre_q = torch.einsum("bhcd,bhcde->bhce", q_n, W1i)     # (b, h, c, m)
-            out[:, :, n * C:(n + 1) * C] = torch.einsum("bhce,bhced->bhcd", F.silu(pre_q), W2i)
-
-            # Carry the final (full) memory + momentum state into the next chunk.
-            W1, W2 = W1i[:, :, -1], W2i[:, :, -1]
-            mW1, mW2 = mW1n[:, :, -1], mW2n[:, :, -1]
-
-        return out[:, :, :T]
+        return torch.cat(outs, dim=2)[:, :, :T]
 
     def state_size(self, sequence_length: int = 2048) -> int:
         # Fast-weight memory per head: W1 (head_dim, mem_hidden) + W2 (mem_hidden, head_dim).
@@ -324,7 +341,8 @@ def build(cfg, layer_idx: int) -> nn.Module:
         conv_size=cfg.titans_conv_size, use_short_conv=cfg.titans_use_short_conv,
         mode=cfg.titans_mode, chunk_size=cfg.titans_chunk_size,
         update_norm=cfg.titans_update_norm, weight_norm=cfg.titans_weight_norm,
-        update_eps=cfg.titans_update_eps, layer_idx=layer_idx,
+        update_eps=cfg.titans_update_eps, checkpoint_chunks=cfg.titans_checkpoint_chunks,
+        layer_idx=layer_idx,
     )
 
 

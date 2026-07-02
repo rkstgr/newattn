@@ -93,6 +93,24 @@ def test_titans_stable_finite_in_blowup_regime():
     assert torch.isfinite(g).all(), "stabilized chunk grad should stay finite"
 
 
+def test_titans_chunk_checkpoint_transparent():
+    """Per-chunk gradient checkpointing (the T4 OOM fix) changes nothing numerically: identical
+    outputs and identical grads for the input and every parameter, in the exp006 stable config."""
+    torch.manual_seed(0)
+    m = Titans(d_model=32, num_heads=1, memory_mult=4, head_dim=32, mode="chunk", chunk_size=8,
+               update_norm="frobenius", weight_norm=True)
+
+    def run(ckpt):
+        m.checkpoint_chunks = ckpt
+        m.zero_grad()
+        xs = torch.randn(4, 128, 32, generator=torch.Generator().manual_seed(1), requires_grad=True)
+        m(xs).square().sum().backward()
+        return [xs.grad] + [p.grad.clone() for p in m.parameters()]
+
+    for g_ckpt, g_plain in zip(run(True), run(False)):
+        assert (g_ckpt - g_plain).abs().max().item() < 1e-6, "checkpointed grads diverge"
+
+
 def test_titans_chunk_odd_length():
     """Sequence length not divisible by chunk_size (pad path) preserves length and the chunk1 match."""
     torch.manual_seed(0)
@@ -125,7 +143,8 @@ def test_gdn2_chunk_matches_recurrent():
 if __name__ == "__main__":
     for fn in [test_titans_chunk1_equals_recurrent, test_titans_chunk_finite,
                test_titans_stable_chunk1_equals_recurrent, test_titans_stable_finite_in_blowup_regime,
-               test_titans_chunk_odd_length, test_gdn2_chunk_matches_recurrent]:
+               test_titans_chunk_checkpoint_transparent, test_titans_chunk_odd_length,
+               test_gdn2_chunk_matches_recurrent]:
         fn()
         print(f"PASS  {fn.__name__}")
     print("All chunk-equivalence tests passed.")

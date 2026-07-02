@@ -116,3 +116,29 @@ def build_dataloaders(task: MQARTaskConfig, seed: int, batch_size: int, test_bat
                                            generator=g, drop_last=drop_last)
     test_dl = torch.utils.data.DataLoader(test_ds, batch_size=test_batch_size, shuffle=False)
     return train_dl, test_dl, fingerprint
+
+
+def build_eval_dataloader(task: MQARTaskConfig, seed: int, batch_size: int):
+    """Test-set-only loader for a post-training generalization eval.
+
+    The eval seed is derived from (seed, input_seq_len, num_kv_pairs), so every grid cell gets a
+    distinct, reproducible test set. Generation runs under a forked torch RNG because
+    `random_non_queries` draws from the *global* torch generator -- without the fork the test set
+    would depend on how much RNG state training consumed, and would differ across runs.
+
+    Returns (test_dl, fingerprint).
+    """
+    digest = hashlib.md5(f"eval-{seed}-{task.input_seq_len}-{task.num_kv_pairs}".encode()).digest()
+    eval_seed = int.from_bytes(digest[:4], "little")
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(eval_seed)
+        inputs, labels = multiquery_ar(
+            vocab_size=task.vocab_size, num_examples=task.num_test_examples,
+            input_seq_len=task.input_seq_len, seed=eval_seed,
+            power_a=task.power_a, num_kv_pairs=task.num_kv_pairs,
+            random_non_queries=task.random_non_queries,
+        )
+
+    fingerprint = hashlib.md5(inputs.numpy().tobytes() + labels.numpy().tobytes()).hexdigest()
+    test_ds = torch.utils.data.TensorDataset(inputs, labels)
+    return torch.utils.data.DataLoader(test_ds, batch_size=batch_size, shuffle=False), fingerprint

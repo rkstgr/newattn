@@ -3,22 +3,25 @@
 `run_sweep(SweepConfig)` trains one model per `SweepPoint` in `cfg.points` (all at the fixed
 `cfg.d_model`), maps each point to its state size on the x-axis, logs everything to W&B, and
 produces the final state-size-vs-accuracy figure (saved to disk and logged as a W&B image /
-table / line).
+table / line). Optionally, each trained model is then evaluated in-process on harder/longer
+MQAR settings (`cfg.eval_settings`), and its weights + config are persisted for later
+re-evaluation (`cfg.out_dir`; weights also uploaded to W&B).
 """
 from __future__ import annotations
 
 import json
+import os
 import uuid
 
 import torch
 
-from .config import ModelConfig, SweepConfig
-from .data import build_dataloaders
+from .config import EvalSetting, ModelConfig, MQARTaskConfig, SweepConfig
+from .data import build_dataloaders, build_eval_dataloader
 from .determinism import get_device, set_determinism
 from .mixers import get_spec
 from .model import LanguageModel
 from .tracking import WandbLogger, build_full_config, maybe_login
-from .train import train_one_run
+from .train import evaluate, train_one_run
 
 MIXER_LABEL = {"attention": "Transformer (attention)", "mamba2": "Mamba2",
                "gdn2": "Gated DeltaNet 2", "gdn2_triton": "Gated DeltaNet 2 (Triton)",
@@ -46,7 +49,44 @@ def _point_dims(cfg, pt) -> tuple[int, dict]:
     return d_model, overrides
 
 
-def run_sweep(cfg: SweepConfig) -> list[dict]:
+def _build_model_config(cfg: SweepConfig, d_model: int, overrides: dict) -> ModelConfig:
+    """ModelConfig for one run: task-driven defaults (vocab, pos-emb table sized to the training
+    sequence) with explicit overrides winning -- e.g. model_overrides={"max_position_embeddings": 0}
+    trains without position embeddings (NoPE) so the model can run at any eval length."""
+    overrides = dict(overrides)
+    max_pos = overrides.pop("max_position_embeddings", cfg.task.input_seq_len)
+    return ModelConfig(d_model=d_model, mixer=cfg.mixer, vocab_size=cfg.task.vocab_size,
+                       max_position_embeddings=max_pos, **overrides)
+
+
+def run_generalization_evals(model, *, base_task: MQARTaskConfig, settings: list[EvalSetting],
+                             seed: int, device: str, use_amp: bool, amp_dtype: str,
+                             default_batch_size: int) -> dict[str, dict]:
+    """Evaluate a trained model on harder/longer MQAR settings (fresh deterministic test sets).
+
+    Settings whose sequence length exceeds the model's (finite) position-embedding table are
+    skipped and recorded as such -- learned absolute position embeddings cannot extrapolate.
+    Returns {setting.label: {"accuracy", "loss", "fingerprint", "skipped"}}.
+    """
+    eval_model = getattr(model, "_orig_mod", model)  # eager module: new eval shapes must not recompile
+    max_pos = eval_model.cfg.max_position_embeddings
+    results = {}
+    for setting in settings:
+        if 0 < max_pos < setting.input_seq_len:
+            results[setting.label] = {"accuracy": None, "loss": None, "fingerprint": None,
+                                      "skipped": "pos_emb"}
+            print(f"  eval {setting.label:<11s}  skipped (pos-emb table {max_pos} < seq_len)")
+            continue
+        dl, fingerprint = build_eval_dataloader(setting.to_task(base_task), seed=seed,
+                                                batch_size=setting.batch_size or default_batch_size)
+        loss, acc = evaluate(eval_model, dl, device, use_amp, amp_dtype)
+        results[setting.label] = {"accuracy": acc, "loss": loss, "fingerprint": fingerprint,
+                                  "skipped": None}
+        print(f"  eval {setting.label:<11s}  loss={loss:.4f}  accuracy={acc:.4f}")
+    return results
+
+
+def run_sweep(cfg: SweepConfig, *, plot: bool = True) -> list[dict]:
     device = get_device()
     spec = get_spec(cfg.mixer)
     sweep_id = uuid.uuid4().hex[:8]
@@ -64,7 +104,7 @@ def run_sweep(cfg: SweepConfig) -> list[dict]:
     print(f"Planned sweep (mixer={cfg.mixer!r}; d_model={cfg.d_model}; state size is the x-axis):")
     for pt in cfg.points:
         d_model, overrides = _point_dims(cfg, pt)
-        mc = ModelConfig(d_model=d_model, mixer=cfg.mixer, **overrides)
+        mc = _build_model_config(cfg, d_model, overrides)
         state = spec.state_size_bytes(mc, n_layers, cfg.task.input_seq_len)
         label = pt.label or _point_label(pt)
         print(f"  {label:<12s}  d_model={d_model:>4d}  {spec.dims_str(mc)}  ->  "
@@ -85,8 +125,7 @@ def run_sweep(cfg: SweepConfig) -> list[dict]:
         train_dl, test_dl, fingerprint = build_dataloaders(
             cfg.task, seed=cfg.seed, batch_size=cfg.train.batch_size,
             test_batch_size=cfg.train.test_batch_size, drop_last=cfg.train.compile)
-        model_cfg = ModelConfig(d_model=d_model, mixer=cfg.mixer, vocab_size=cfg.task.vocab_size,
-                                max_position_embeddings=cfg.task.input_seq_len, **overrides)
+        model_cfg = _build_model_config(cfg, d_model, overrides)
         model = LanguageModel(model_cfg)
 
         # torch.compile: Inductor fuses the per-token mixer loops + CUDA graphs eliminate launch
@@ -127,9 +166,34 @@ def run_sweep(cfg: SweepConfig) -> list[dict]:
         metrics = train_one_run(model, train_dl, test_dl, logger, peak_lr=peak_lr,
                                 train=cfg.train, device=device, use_amp=use_amp)
 
+        # ---- post-training generalization evals (harder/longer settings, same trained model) ----
+        evals = {}
+        if cfg.eval_settings:
+            print("  Generalization evals:")
+            evals = run_generalization_evals(
+                model, base_task=cfg.task, settings=cfg.eval_settings, seed=cfg.seed,
+                device=device, use_amp=use_amp, amp_dtype=cfg.train.amp_dtype,
+                default_batch_size=cfg.train.test_batch_size)
+
+        # ---- persist weights + config so the run can be re-evaluated without retraining ----
+        ckpt_path = None
+        if cfg.out_dir:
+            os.makedirs(cfg.out_dir, exist_ok=True)
+            run_stem = os.path.join(cfg.out_dir, f"{cfg.mixer}-{label}")
+            ckpt_path = f"{run_stem}.pt"
+            torch.save(getattr(model, "_orig_mod", model).state_dict(), ckpt_path)
+            with open(f"{run_stem}.config.json", "w") as f:
+                json.dump(full_config, f, indent=2)
+            print(f"  Saved weights + config to {run_stem}.*")
+
         if run is not None:
             run.summary.update({"state_size": state_size, "num_parameters": num_params,
                                 "peak_learning_rate": peak_lr, **metrics})
+            if evals:
+                run.summary.update({f"eval/{lbl}/{k}": v for lbl, rec in evals.items()
+                                    for k, v in rec.items() if v is not None})
+            if ckpt_path is not None:  # weights survive ephemeral (e.g. Colab) storage
+                run.save(ckpt_path, base_path=cfg.out_dir)
             run.finish()
 
         results.append({
@@ -139,6 +203,7 @@ def run_sweep(cfg: SweepConfig) -> list[dict]:
             "learning_rate": peak_lr,
             "valid_accuracy": metrics["valid/accuracy"],
             "valid_best_accuracy": metrics["valid/best_accuracy"],
+            "evals": evals,
         })
 
     print("\nSweep complete.")
@@ -146,7 +211,8 @@ def run_sweep(cfg: SweepConfig) -> list[dict]:
         print(f"  state_size={r['state_size']:>11d}  {r['label']:<12s}  "
               f"lr={r['learning_rate']:.2e}  best_acc={r['valid_best_accuracy']:.4f}")
 
-    plot_results(cfg, results, sweep_id=sweep_id, group=group, wandb_mode=wandb_mode)
+    if plot:
+        plot_results(cfg, results, sweep_id=sweep_id, group=group, wandb_mode=wandb_mode)
     return results
 
 

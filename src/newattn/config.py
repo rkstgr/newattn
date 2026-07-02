@@ -6,7 +6,7 @@ easy to edit in a script or override from the command line.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 
 @dataclass
@@ -60,6 +60,28 @@ class MQARTaskConfig:
     random_non_queries: bool = True
     num_train_examples: int = 50_000
     num_test_examples: int = 1_000
+
+
+@dataclass
+class EvalSetting:
+    """One post-training generalization eval: a fresh MQAR test set at a (possibly harder) setting.
+
+    Only the two difficulty knobs are swept; vocab / power-law / distractor settings are inherited
+    from the training task via `to_task`, so the eval distribution differs from training only in
+    sequence length and number of KV pairs."""
+
+    input_seq_len: int
+    num_kv_pairs: int
+    num_examples: int = 1_000
+    batch_size: int | None = None  # None -> TrainParams.test_batch_size
+
+    @property
+    def label(self) -> str:
+        return f"s{self.input_seq_len}_kv{self.num_kv_pairs}"
+
+    def to_task(self, base: MQARTaskConfig) -> MQARTaskConfig:
+        return replace(base, input_seq_len=self.input_seq_len,
+                       num_kv_pairs=self.num_kv_pairs, num_test_examples=self.num_examples)
 
 
 @dataclass
@@ -179,6 +201,13 @@ class SweepConfig:
 
     task: MQARTaskConfig = field(default_factory=MQARTaskConfig)
     train: TrainParams = field(default_factory=TrainParams)
+
+    # Post-training generalization evals: each setting gets a fresh deterministic test set
+    # (see data.build_eval_dataloader); empty (the default) skips the eval stage entirely.
+    eval_settings: list[EvalSetting] = field(default_factory=list)
+    # When set, run_sweep saves per-run weights + config under this directory (weights also
+    # uploaded to W&B), so trained models can be re-evaluated later without retraining.
+    out_dir: str | None = None
 
     # ---- Weights & Biases ----
     wandb_project: str = "zoology-mqar"

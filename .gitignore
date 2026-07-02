@@ -16,3 +16,4 @@ wandb/
 config.json
 mqar_state_size_vs_accuracy.png
 *.png
+results/**/*.pt

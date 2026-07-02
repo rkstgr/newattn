@@ -42,6 +42,22 @@ def compute_metrics(preds, targets, ignore_index=-100):
     return accs
 
 
+def evaluate(model, dl, device: str, use_amp: bool = False, amp_dtype: str = "bfloat16"):
+    """One pass over `dl`: returns (mean CE loss, mean per-example recall accuracy)."""
+    loss_fn = nn.CrossEntropyLoss()  # default ignore_index = -100
+    model.eval()
+    total_loss, accs = 0.0, []
+    with torch.no_grad():
+        for inputs, targets in dl:
+            inputs, targets = inputs.to(device), targets.to(device)
+            with torch.autocast(device_type=device, dtype=_AMP_DTYPES[amp_dtype], enabled=use_amp):
+                logits = model(inputs)
+            loss = loss_fn(rearrange(logits, "... c -> (...) c").float(), targets.flatten())
+            total_loss += loss.item() / len(dl)
+            accs.extend(compute_metrics(logits.argmax(-1).cpu(), targets.cpu()))
+    return total_loss, float(np.mean(accs))
+
+
 def train_one_run(model, train_dl, test_dl, logger, peak_lr: float, train: TrainParams,
                   device: str, use_amp: bool = False):
     model.to(device)
@@ -93,17 +109,7 @@ def train_one_run(model, train_dl, test_dl, logger, peak_lr: float, train: Train
             logger.log({"train/loss": loss.item(), "lr": scheduler.get_last_lr()[0], "epoch": epoch})
 
         # ---- eval ----
-        model.eval()
-        test_loss, accs = 0.0, []
-        with torch.no_grad():
-            for inputs, targets in test_dl:
-                inputs, targets = inputs.to(device), targets.to(device)
-                logits = forward_logits(inputs)
-                loss = loss_fn(rearrange(logits, "... c -> (...) c").float(), targets.flatten())
-                test_loss += loss.item() / len(test_dl)
-                accs.extend(compute_metrics(logits.argmax(-1).cpu(), targets.cpu()))
-
-        acc = float(np.mean(accs))
+        test_loss, acc = evaluate(model, test_dl, device, use_amp, train.amp_dtype)
         if acc > best_acc:
             best_acc, epochs_no_improve = acc, 0
         else:
